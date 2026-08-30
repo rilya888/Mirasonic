@@ -839,6 +839,36 @@ async def _noop_ok(params, request: Request) -> Response:
     return _ok_response()
 
 
+def _submission_is_true(raw: Optional[str]) -> bool:
+    return raw is None or raw.lower() in ("true", "1")
+
+
+def _parse_scrobble_time(raw: Optional[str]) -> Optional[int]:
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+async def _scrobble(params, request: Request) -> Response:
+    if not _submission_is_true(params.get("submission")):
+        return _ok_response()
+    ids = params.getlist("id")
+    if not ids:
+        return _error_response(10, "Required parameter 'id' is missing")
+    raw_times = params.getlist("time")
+    for index, video_id in enumerate(ids):
+        played_at_ms = _parse_scrobble_time(
+            raw_times[index] if index < len(raw_times) else None
+        )
+        meta = await _resolve_song_meta(video_id)
+        _get_library().record_listen({"id": video_id, **meta}, played_at_ms)
+    return _ok_response()
+
+
 async def _not_found(params, request: Request) -> Response:
     return _error_response(70, "Not found")
 
@@ -867,7 +897,7 @@ _register_stub("getInternetRadioStations", "internetRadioStations")
 _register_stub("getSimilarSongs2", "similarSongs2")
 
 _HANDLERS["getOpenSubsonicExtensions"] = _noop_ok
-_HANDLERS["scrobble"] = _noop_ok
+_HANDLERS["scrobble"] = _scrobble
 _HANDLERS["setRating"] = _noop_ok
 _HANDLERS["deletePodcastEpisode"] = _noop_ok
 
