@@ -679,6 +679,27 @@ def test_scrobble_records_completed_listen(lib, monkeypatch):
     assert lib.get_listen_stats(0)[0]["listen_count"] == 1
 
 
+@pytest.mark.parametrize("submission, should_count", [
+    ("TRUE", True),
+    ("1", True),
+    ("FALSE", False),
+    ("0", False),
+])
+def test_scrobble_submission_values_follow_protocol(lib, monkeypatch, submission,
+                                                    should_count):
+    async def meta(video_id):
+        return {"title": video_id, "artist": "Artist", "duration": 180,
+                "artwork_url": None}
+
+    monkeypatch.setattr(subsonic, "_resolve_song_meta", meta)
+    response = client.get("/rest/scrobble.view", params={
+        **token_params(), "id": f"vid-submission-{submission}",
+        "time": "1700000000000", "submission": submission,
+    })
+    assert response.status_code == 200
+    assert bool(lib.get_listen_stats(0)) is should_count
+
+
 def test_scrobble_playing_now_does_not_count(lib):
     response = client.get("/rest/scrobble.view", params={
         **token_params(), "id": "vid-1", "submission": "false",
@@ -699,7 +720,12 @@ def test_scrobble_accepts_repeated_ids_and_times(lib, monkeypatch):
         ("submission", "true"),
     ])
     assert response.status_code == 200
-    assert sum(row["listen_count"] for row in lib.get_listen_stats(0)) == 2
+    stats = {row["song_id"]: row["last_played_ms"]
+             for row in lib.get_listen_stats(0)}
+    assert stats == {
+        "vid-1": 1700000000000,
+        "vid-2": 1700000180000,
+    }
 
 
 def test_scrobble_missing_id_returns_error(lib):
@@ -750,6 +776,31 @@ def test_scrobble_repeated_explicit_pair_is_idempotent(lib, monkeypatch):
     ]
     response = client.get("/rest/scrobble.view", params=params)
     assert response.status_code == 200
+    assert lib.get_listen_stats(0)[0]["listen_count"] == 1
+
+
+def test_scrobble_untimed_same_song_is_deduplicated_within_30_seconds(
+        lib, monkeypatch):
+    import asyncio
+    from starlette.datastructures import QueryParams
+
+    async def meta(video_id):
+        return {"title": video_id, "artist": "Artist", "duration": 180,
+                "artwork_url": None}
+
+    now_values = iter([1700000000000, 1700000010000])
+    monkeypatch.setattr(subsonic, "_resolve_song_meta", meta)
+    monkeypatch.setattr(library, "_now_ms", lambda: next(now_values))
+
+    first = asyncio.run(subsonic._scrobble(
+        QueryParams([("id", "vid-untimed"), ("time", "broken")]),
+        None,
+    ))
+    second = asyncio.run(subsonic._scrobble(
+        QueryParams([("id", "vid-untimed")]), None
+    ))
+
+    assert first.status_code == second.status_code == 200
     assert lib.get_listen_stats(0)[0]["listen_count"] == 1
 
 
