@@ -41,14 +41,15 @@ services:
   # surface and does not need worker to be available to rank or persist data.
   agent:
     image: mirasonic:0.1.0
+    profiles: [agent]
     build:
       context: .
     command: ["python", "music_agent.py", "daemon"]
     environment:
       MIRASONIC_DB: /data/mirasonic.db
       REGION: ${REGION:?set REGION in .env, e.g. US}
-      LISTENBRAINZ_USER: ${LISTENBRAINZ_USER:?set LISTENBRAINZ_USER in .env}
-      LISTENBRAINZ_TOKEN: ${LISTENBRAINZ_TOKEN:?set LISTENBRAINZ_TOKEN in .env}
+      LISTENBRAINZ_USER: ${LISTENBRAINZ_USER:-}
+      LISTENBRAINZ_TOKEN: ${LISTENBRAINZ_TOKEN:-}
       AGENT_WEEKDAY: ${AGENT_WEEKDAY:-0}
       AGENT_HOUR_UTC: ${AGENT_HOUR_UTC:-6}
       AGENT_PLAYLIST_SIZE: ${AGENT_PLAYLIST_SIZE:-30}

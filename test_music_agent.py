@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 import pytest
@@ -676,8 +677,8 @@ async def test_daemon_catches_up_incomplete_week_and_skips_completed(monkeypatch
         def get_weekly_run(self, week_start):
             return {"status": "completed"}
 
-    async def fake_weekly(lib, lb, user, run_now, size):
-        calls.append((lib, user, run_now, size))
+    async def fake_weekly(lib, lb, user, run_now, size, *, week_start=None):
+        calls.append((lib, user, run_now, size, week_start))
 
     async def stop_after_one_hour(_):
         raise asyncio.CancelledError
@@ -689,7 +690,7 @@ async def test_daemon_catches_up_incomplete_week_and_skips_completed(monkeypatch
         await music_agent.daemon(config, CompletedLibrary(), object(), now_fn=lambda: now, sleep=stop_after_one_hour)
 
     assert len(calls) == 1
-    assert calls[0][1:] == ("listener", now, 30)
+    assert calls[0][1:] == ("listener", now, 30, "2026-08-24")
 
 
 @pytest.mark.asyncio
@@ -703,7 +704,7 @@ async def test_daemon_logs_generic_failure_and_continues_without_token(monkeypat
         def get_weekly_run(self, week_start):
             return {"status": "running"}
 
-    async def fail(*args):
+    async def fail(*args, **kwargs):
         raise RuntimeError(secret)
 
     async def stop_after_one_hour(_):
@@ -717,5 +718,115 @@ async def test_daemon_logs_generic_failure_and_continues_without_token(monkeypat
             now_fn=lambda: datetime(2026, 8, 29, 12, tzinfo=timezone.utc), sleep=stop_after_one_hour,
         )
 
-    assert "weekly agent run failed week_start=2026-08-24" in caplog.text
+    assert "weekly agent iteration failed week_start=2026-08-24 error_type=RuntimeError" in caplog.text
     assert secret not in caplog.text
+
+
+def test_scheduled_non_monday_occurrence_uses_its_calendar_monday():
+    import music_agent
+
+    week_start, scheduled = music_agent.scheduled_week(
+        datetime(2026, 8, 27, 7, tzinfo=timezone.utc), weekday=2, hour_utc=6
+    )
+
+    assert week_start == "2026-08-24"
+    assert scheduled == datetime(2026, 8, 26, 6, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_daemon_uses_scheduled_week_identity_and_skips_completed_week(tmp_path):
+    import music_agent
+
+    lib = library.Library(str(tmp_path / "library.db"))
+    config = music_agent.AgentConfig(str(tmp_path / "library.db"), "listener", "token", 0, 6, 30)
+    now = datetime(2026, 8, 24, 5, 59, tzinfo=timezone.utc)
+    sleeps = 0
+
+    async def stop_after_second_iteration(_):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 2:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await music_agent.daemon(
+            config, lib, FakeListenBrainz(), now_fn=lambda: now, sleep=stop_after_second_iteration
+        )
+
+    assert lib.get_weekly_run("2026-08-17")["status"] == "completed"
+    assert lib.get_weekly_run("2026-08-24") is None
+    assert sleeps == 2
+
+
+@pytest.mark.asyncio
+async def test_daemon_maps_non_monday_schedule_to_its_monday_run(tmp_path):
+    import music_agent
+
+    lib = library.Library(str(tmp_path / "library.db"))
+    config = music_agent.AgentConfig(str(tmp_path / "library.db"), "listener", "token", 2, 6, 30)
+
+    async def stop_after_first_iteration(_):
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await music_agent.daemon(
+            config, lib, FakeListenBrainz(),
+            now_fn=lambda: datetime(2026, 8, 26, 7, tzinfo=timezone.utc), sleep=stop_after_first_iteration,
+        )
+
+    assert lib.get_weekly_run("2026-08-24")["status"] == "completed"
+    assert lib.get_weekly_run("2026-08-26") is None
+
+
+@pytest.mark.asyncio
+async def test_daemon_recovers_from_get_weekly_run_error_without_logging_token(tmp_path, monkeypatch, caplog):
+    import music_agent
+
+    secret = "token=not-for-logs"
+    lib = library.Library(str(tmp_path / "library.db"))
+    config = music_agent.AgentConfig(str(tmp_path / "library.db"), "listener", secret, 0, 6, 30)
+    original_get_weekly_run = lib.get_weekly_run
+    attempts = 0
+    sleeps = 0
+
+    def flaky_get_weekly_run(week_start):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError(secret)
+        return original_get_weekly_run(week_start)
+
+    async def stop_after_second_iteration(_):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(lib, "get_weekly_run", flaky_get_weekly_run)
+    caplog.set_level(logging.ERROR)
+    with pytest.raises(asyncio.CancelledError):
+        await music_agent.daemon(
+            config, lib, FakeListenBrainz(),
+            now_fn=lambda: datetime(2026, 8, 29, 12, tzinfo=timezone.utc), sleep=stop_after_second_iteration,
+        )
+
+    assert lib.get_weekly_run("2026-08-24")["status"] == "completed"
+    assert sleeps == 2
+    assert "RuntimeError" in caplog.text
+    assert secret not in caplog.text
+
+
+def test_agent_config_repr_hides_token():
+    import music_agent
+
+    assert "not-for-repr" not in repr(
+        music_agent.AgentConfig("/tmp/music.db", "listener", "not-for-repr", 0, 6, 30)
+    )
+
+
+def test_agent_compose_is_opt_in_and_allows_empty_listenbrainz_credentials():
+    compose = Path("compose.yaml").read_text()
+
+    assert "profiles: [agent]" in compose
+    assert "LISTENBRAINZ_USER: ${LISTENBRAINZ_USER:-}" in compose
+    assert "LISTENBRAINZ_TOKEN: ${LISTENBRAINZ_TOKEN:-}" in compose

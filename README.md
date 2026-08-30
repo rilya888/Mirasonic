@@ -114,9 +114,16 @@ same library database and do not require a ListenBrainz account or network
 access.
 
 Set `LISTENBRAINZ_USER` and `LISTENBRAINZ_TOKEN` in `.env`, then start the
-stack normally. The agent checks once per hour and catches up the most recent
-scheduled week after a restart or temporary failure. `AGENT_WEEKDAY=0` means
-Monday, and `AGENT_HOUR_UTC` is always UTC.
+agent explicitly:
+
+```sh
+docker compose --profile agent up -d
+```
+
+The agent checks once per hour and catches up the most recent scheduled week
+after a restart or temporary failure. `AGENT_WEEKDAY=0` means Monday, and
+`AGENT_HOUR_UTC` is always UTC. Without this profile, ordinary `docker compose
+up -d` starts only the playback worker and never needs ListenBrainz credentials.
 
 For one-off operations:
 

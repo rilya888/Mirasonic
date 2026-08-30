@@ -6,8 +6,8 @@ import logging
 import os
 import re
 import unicodedata
-from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Callable, Mapping, Optional
 
 import httpx
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 class AgentConfig:
     db_path: str
     user: str | None
-    token: str | None
+    token: str | None = field(repr=False)
     weekday: int
     hour_utc: int
     playlist_size: int
@@ -50,7 +50,8 @@ def scheduled_week(now: datetime, weekday: int, hour_utc: int) -> tuple[str, dat
     target = datetime.combine(target_date, time(hour_utc), tzinfo=timezone.utc)
     if target > now_utc:
         target -= timedelta(days=7)
-    return target.date().isoformat(), target
+    week_start = target.date() - timedelta(days=target.weekday())
+    return week_start.isoformat(), target
 
 
 def agent_config(
@@ -170,10 +171,24 @@ def _validate_size(size: object) -> int:
     return value
 
 
-async def run_weekly(lib, lb, user: str, now: datetime, size: int) -> dict:
+def _weekly_run_start(now: datetime, week_start: str | None) -> str:
+    if week_start is None:
+        return (now.date() - timedelta(days=now.weekday())).isoformat()
+    try:
+        parsed = date.fromisoformat(week_start)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("week_start must be an ISO Monday date") from exc
+    if parsed.weekday() != 0:
+        raise ValueError("week_start must be an ISO Monday date")
+    return parsed.isoformat()
+
+
+async def run_weekly(
+    lib, lb, user: str, now: datetime, size: int, *, week_start: str | None = None
+) -> dict:
     size = _validate_size(size)
     now_utc = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
-    week_start = now_utc.date().fromordinal(now_utc.date().toordinal() - now_utc.weekday()).isoformat()
+    week_start = _weekly_run_start(now_utc, week_start)
     existing = lib.get_weekly_run(week_start)
     if existing is not None and existing["status"] == "completed":
         return _completed_result(lib, existing)
@@ -281,15 +296,24 @@ async def daemon(
 ) -> None:
     """Check hourly and retry the latest scheduled run until it completes."""
     while True:
-        now = now_fn()
-        week_start, _scheduled = scheduled_week(now, config.weekday, config.hour_utc)
-        run = lib.get_weekly_run(week_start)
-        if run is None or run["status"] != "completed":
-            try:
-                await run_weekly(lib, lb, config.user or "", now, config.playlist_size)
-            except Exception:
-                # Do not include the exception: HTTP clients can contain a token in it.
-                logger.error("weekly agent run failed week_start=%s", week_start)
+        week_start = None
+        try:
+            now = now_fn()
+            week_start, _scheduled = scheduled_week(now, config.weekday, config.hour_utc)
+            run = lib.get_weekly_run(week_start)
+            if run is None or run["status"] != "completed":
+                await run_weekly(
+                    lib, lb, config.user or "", now, config.playlist_size, week_start=week_start
+                )
+        except Exception as exc:
+            # Never include raw exceptions: HTTP clients can contain a token in them.
+            if week_start is None:
+                logger.error("weekly agent iteration failed error_type=%s", type(exc).__name__)
+            else:
+                logger.error(
+                    "weekly agent iteration failed week_start=%s error_type=%s",
+                    week_start, type(exc).__name__,
+                )
         await sleep(3600)
 
 
