@@ -315,8 +315,9 @@ class Library:
                 event_ms = _now_ms()
                 duplicate = self._conn.execute(
                     "SELECT 1 FROM listening_events "
-                    "WHERE song_id = ? AND played_at_ms >= ? ORDER BY played_at_ms DESC LIMIT 1",
-                    (song["id"], event_ms - 30_000),
+                    "WHERE song_id = ? AND played_at_ms BETWEEN ? AND ? "
+                    "ORDER BY played_at_ms DESC LIMIT 1",
+                    (song["id"], event_ms - 30_000, event_ms),
                 ).fetchone()
                 if duplicate is not None:
                     self._conn.commit()

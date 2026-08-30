@@ -28,6 +28,15 @@ def test_record_listen_suppresses_untimed_retry(monkeypatch, tmp_path):
     assert lib.record_listen(song(), None) is True
 
 
+def test_record_listen_does_not_suppress_untimed_event_for_future_explicit_event(
+    monkeypatch, tmp_path
+):
+    lib = library.Library(str(tmp_path / "library.db"))
+    assert lib.record_listen(song(), 1_700_000_010_000) is True
+    monkeypatch.setattr(library, "_now_ms", lambda: 1_700_000_000_000)
+    assert lib.record_listen(song(), None) is True
+
+
 def test_unsynced_listens_include_track_metadata(tmp_path):
     lib = library.Library(str(tmp_path / "library.db"))
     lib.record_listen(song(), 1_700_000_000_000)
