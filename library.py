@@ -10,6 +10,7 @@ about SQLite.
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -54,6 +55,38 @@ CREATE TABLE IF NOT EXISTS spotify_map (
   song_id     TEXT NOT NULL REFERENCES songs(id),
   mapped_at   TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS listening_events (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  song_id        TEXT NOT NULL REFERENCES songs(id),
+  played_at_ms   INTEGER NOT NULL,
+  external_sent_at_ms INTEGER,
+  created_at     TEXT NOT NULL,
+  UNIQUE(song_id, played_at_ms)
+);
+CREATE INDEX IF NOT EXISTS listening_events_played_at_idx
+  ON listening_events(played_at_ms);
+CREATE INDEX IF NOT EXISTS listening_events_unsynced_idx
+  ON listening_events(external_sent_at_ms, id);
+
+CREATE TABLE IF NOT EXISTS weekly_runs (
+  week_start     TEXT PRIMARY KEY,
+  status         TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed')),
+  playlist_id    INTEGER REFERENCES playlists(id) ON DELETE SET NULL,
+  started_at     TEXT NOT NULL,
+  finished_at    TEXT,
+  error_message  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS recommendation_items (
+  week_start     TEXT NOT NULL REFERENCES weekly_runs(week_start) ON DELETE CASCADE,
+  position       INTEGER NOT NULL,
+  song_id        TEXT NOT NULL REFERENCES songs(id),
+  source         TEXT NOT NULL,
+  recording_mbid TEXT,
+  score          REAL NOT NULL,
+  PRIMARY KEY (week_start, position)
+);
 """
 
 
@@ -62,6 +95,10 @@ def _now_iso() -> str:
     with milliseconds (ISO8601DateFormatter.withFractionalSeconds)."""
     now = datetime.now(timezone.utc)
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+
+
+def _now_ms() -> int:
+    return time.time_ns() // 1_000_000
 
 
 class Library:
@@ -266,3 +303,76 @@ class Library:
             "ORDER BY st.starred_at"
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_listen(self, song: dict, played_at_ms: Optional[int]) -> bool:
+        with self._lock:
+            self._insert_song_unlocked(
+                song["id"], song["title"], song["artist"], song.get("album"),
+                song.get("duration"), song.get("artwork_url"),
+            )
+            event_ms = played_at_ms
+            if event_ms is None:
+                event_ms = _now_ms()
+                duplicate = self._conn.execute(
+                    "SELECT 1 FROM listening_events "
+                    "WHERE song_id = ? AND played_at_ms >= ? ORDER BY played_at_ms DESC LIMIT 1",
+                    (song["id"], event_ms - 30_000),
+                ).fetchone()
+                if duplicate is not None:
+                    self._conn.commit()
+                    return False
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO listening_events "
+                "(song_id, played_at_ms, created_at) VALUES (?, ?, ?)",
+                (song["id"], event_ms, _now_iso()),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def get_listen_stats(self, since_ms: int) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT s.id AS song_id, s.title, s.artist, s.album, s.duration, "
+            "COUNT(e.id) AS listen_count, MAX(e.played_at_ms) AS last_played_ms, "
+            "CASE WHEN st.song_id IS NULL THEN 0 ELSE 1 END AS starred "
+            "FROM songs s JOIN listening_events e ON e.song_id = s.id "
+            "LEFT JOIN starred st ON st.song_id = s.id "
+            "WHERE e.played_at_ms >= ? GROUP BY s.id ORDER BY s.id",
+            (since_ms,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_unsynced_listens(self, limit: int = 100) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT e.id AS event_id, e.played_at_ms, s.id AS song_id, "
+            "s.title, s.artist, s.album, s.duration "
+            "FROM listening_events e JOIN songs s ON s.id = e.song_id "
+            "WHERE e.external_sent_at_ms IS NULL ORDER BY e.id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_listens_synced(self, event_ids: list[int], synced_at_ms: int) -> None:
+        if not event_ids:
+            return
+        with self._lock:
+            self._conn.executemany(
+                "UPDATE listening_events SET external_sent_at_ms = ? WHERE id = ?",
+                [(synced_at_ms, event_id) for event_id in event_ids],
+            )
+            self._conn.commit()
+
+    def get_playlist_song_ids(self) -> list[dict]:
+        playlists = self.get_playlists()
+        for playlist in playlists:
+            rows = self._conn.execute(
+                "SELECT song_id FROM playlist_items WHERE playlist_id = ? ORDER BY position",
+                (playlist["id"],),
+            ).fetchall()
+            playlist["song_ids"] = [row["song_id"] for row in rows]
+        return playlists
+
+    def get_playlist_by_name(self, name: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT id FROM playlists WHERE name = ? ORDER BY id LIMIT 1", (name,)
+        ).fetchone()
+        return None if row is None else self.get_playlist(row["id"])
