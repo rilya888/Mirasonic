@@ -362,6 +362,76 @@ class Library:
             )
             self._conn.commit()
 
+    # -- weekly discovery runs -----------------------------------------
+
+    def get_weekly_run(self, week_start: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM weekly_runs WHERE week_start = ?", (week_start,)
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def begin_weekly_run(self, week_start: str) -> dict:
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT * FROM weekly_runs WHERE week_start = ?", (week_start,)
+            ).fetchone()
+            if existing is not None and existing["status"] == "completed":
+                return dict(existing)
+            now = _now_iso()
+            self._conn.execute(
+                "INSERT INTO weekly_runs (week_start, status, started_at) VALUES (?, 'running', ?) "
+                "ON CONFLICT(week_start) DO UPDATE SET status='running', started_at=excluded.started_at, "
+                "finished_at=NULL, error_message=NULL",
+                (week_start, now),
+            )
+            self._conn.commit()
+            return dict(self._conn.execute(
+                "SELECT * FROM weekly_runs WHERE week_start = ?", (week_start,)
+            ).fetchone())
+
+    def set_weekly_run_playlist(self, week_start: str, playlist_id: int) -> None:
+        """Persist agent ownership immediately after allocating a playlist."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE weekly_runs SET playlist_id = ? WHERE week_start = ?",
+                (playlist_id, week_start),
+            )
+            self._conn.commit()
+
+    def complete_weekly_run(self, week_start: str, playlist_id: Optional[int],
+                            items: list[dict]) -> None:
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "DELETE FROM recommendation_items WHERE week_start = ?", (week_start,)
+                )
+                self._conn.executemany(
+                    "INSERT INTO recommendation_items "
+                    "(week_start, position, song_id, source, recording_mbid, score) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    [(week_start, position, item["song_id"], item["source"],
+                      item.get("recording_mbid"), item["score"])
+                     for position, item in enumerate(items)],
+                )
+                self._conn.execute(
+                    "UPDATE weekly_runs SET status='completed', playlist_id=?, finished_at=?, "
+                    "error_message=NULL WHERE week_start=?",
+                    (playlist_id, _now_iso(), week_start),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def fail_weekly_run(self, week_start: str, message: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE weekly_runs SET status='failed', finished_at=?, error_message=? "
+                "WHERE week_start=?",
+                (_now_iso(), message[:500], week_start),
+            )
+            self._conn.commit()
+
     def get_playlist_song_ids(self) -> list[dict]:
         playlists = self.get_playlists()
         for playlist in playlists:
