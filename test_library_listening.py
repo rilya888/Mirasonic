@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 
 import library
@@ -12,6 +14,67 @@ def song(song_id="vid-1", title="One", artist="Artist"):
         "duration": 180,
         "artwork_url": "https://example.invalid/cover.jpg",
     }
+
+
+def test_opening_legacy_library_preserves_playlist_data_and_adds_agent_tables(tmp_path):
+    """Agent tables must be an additive upgrade for existing Library databases."""
+    path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(path)
+    legacy.executescript(
+        """
+        CREATE TABLE songs (
+          id TEXT PRIMARY KEY, title TEXT NOT NULL, artist TEXT NOT NULL,
+          album TEXT, duration INTEGER, artwork_url TEXT, added_at TEXT NOT NULL
+        );
+        CREATE TABLE playlists (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+          created_at TEXT NOT NULL, changed_at TEXT NOT NULL
+        );
+        CREATE TABLE playlist_items (
+          playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+          position INTEGER NOT NULL, song_id TEXT NOT NULL REFERENCES songs(id),
+          PRIMARY KEY (playlist_id, position)
+        );
+        CREATE TABLE starred (
+          song_id TEXT PRIMARY KEY REFERENCES songs(id), starred_at TEXT NOT NULL
+        );
+        CREATE TABLE spotify_map (
+          spotify_uri TEXT PRIMARY KEY, song_id TEXT NOT NULL REFERENCES songs(id),
+          mapped_at TEXT NOT NULL
+        );
+        """
+    )
+    expected_rows = [
+        ("old-1", "First — unchanged", "Artist A", "Album A", 101,
+         "https://example.invalid/first?raw=1", "2024-01-02T03:04:05.006Z"),
+        ("old-2", "Second", "Artist B", None, None, None, "2024-01-02T03:04:06.007Z"),
+    ]
+    legacy.executemany("INSERT INTO songs VALUES (?, ?, ?, ?, ?, ?, ?)", expected_rows)
+    legacy.execute(
+        "INSERT INTO playlists (id, name, created_at, changed_at) VALUES (7, ?, ?, ?)",
+        ("Old ordered mix", "2024-01-02T03:04:05.006Z", "2024-01-02T03:04:05.006Z"),
+    )
+    legacy.executemany(
+        "INSERT INTO playlist_items (playlist_id, position, song_id) VALUES (7, ?, ?)",
+        [(0, "old-2"), (1, "old-1")],
+    )
+    legacy.commit()
+    legacy.close()
+
+    lib = library.Library(str(path))
+
+    # Compare every legacy column verbatim and retain the established order.
+    rows = lib._conn.execute(
+        "SELECT id, title, artist, album, duration, artwork_url, added_at FROM songs ORDER BY id"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == expected_rows
+    assert [entry["id"] for entry in lib.get_playlist(7)["songs"]] == ["old-2", "old-1"]
+    assert [
+        row[0] for row in lib._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN "
+            "('listening_events', 'weekly_runs', 'recommendation_items') ORDER BY name"
+        )
+    ] == ["listening_events", "recommendation_items", "weekly_runs"]
 
 
 def test_record_listen_is_idempotent_for_explicit_timestamp(tmp_path):
