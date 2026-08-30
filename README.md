@@ -95,9 +95,47 @@ WireGuard VPN or a reverse proxy terminating TLS works just as well.
 | `BIND_ADDRESS` / `HOST_PORT` | `127.0.0.1` / `8094` | Where compose publishes the port on the host. |
 | `LIBRARY_PATH` | `./data` | Host directory holding the library database. |
 | `MIRASONIC_DB` | `/data/mirasonic.db` | Database path inside the container. |
+| `LISTENBRAINZ_USER` | — | ListenBrainz account used by the optional discovery agent. |
+| `LISTENBRAINZ_TOKEN` | — | ListenBrainz token used only by the optional discovery agent. |
+| `AGENT_WEEKDAY` | `0` | Weekly discovery day: Monday is `0`, Sunday is `6`. |
+| `AGENT_HOUR_UTC` | `6` | UTC hour at which the weekly discovery run is due. |
+| `AGENT_PLAYLIST_SIZE` | `30` | Number of discoveries to add, from `1` through `50`. |
 
 There are no defaults for the credentials. Without them the server refuses to
 start rather than letting anything through.
+
+## Weekly music discovery
+
+The optional `agent` service turns your listening history into a weekly
+`Discoveries` playlist. It sends unsynced local listens to ListenBrainz, asks
+ListenBrainz for recommendations and recent releases, then only adds tracks it
+can match on YouTube Music. Rankings remain completely local: they use the
+same library database and do not require a ListenBrainz account or network
+access.
+
+Set `LISTENBRAINZ_USER` and `LISTENBRAINZ_TOKEN` in `.env`, then start the
+stack normally. The agent checks once per hour and catches up the most recent
+scheduled week after a restart or temporary failure. `AGENT_WEEKDAY=0` means
+Monday, and `AGENT_HOUR_UTC` is always UTC.
+
+For one-off operations:
+
+```sh
+docker compose run --rm agent python music_agent.py rankings
+docker compose run --rm agent python music_agent.py weekly
+docker compose logs -f agent
+```
+
+If a weekly run fails, inspect the agent logs and rerun the `weekly` command;
+incomplete runs are safely retried. To rotate the ListenBrainz token, update
+`.env`, then recreate only the agent:
+
+```sh
+docker compose up -d --force-recreate agent
+```
+
+The agent exposes no port. It shares the library database with `worker`, but
+removing the `agent` service leaves normal Subsonic playback unaffected.
 
 ## Client setup
 

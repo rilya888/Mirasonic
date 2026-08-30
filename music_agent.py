@@ -1,15 +1,75 @@
 """Idempotent weekly discovery-playlist orchestration."""
 import asyncio
+import argparse
+import json
+import logging
+import os
 import re
 import unicodedata
-from datetime import datetime, timezone
-from typing import Optional
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta, timezone
+from typing import Callable, Mapping, Optional
 
+import httpx
 import main
+import library
+from listenbrainz_client import ListenBrainzClient
 from ranking import rank_playlists, rank_tracks
 
 
 MAX_PLAYLIST_SIZE = 50
+LISTENBRAINZ_BASE_URL = "https://api.listenbrainz.org"
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    db_path: str
+    user: str | None
+    token: str | None
+    weekday: int
+    hour_utc: int
+    playlist_size: int
+
+
+def _schedule_value(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError("invalid weekly schedule")
+    if isinstance(value, str) and not re.fullmatch(r"-?[0-9]+", value.strip()):
+        raise ValueError("invalid weekly schedule")
+    return int(value)
+
+
+def scheduled_week(now: datetime, weekday: int, hour_utc: int) -> tuple[str, datetime]:
+    """Return the latest UTC schedule occurrence, including a missed run."""
+    if weekday not in range(7) or hour_utc not in range(24):
+        raise ValueError("invalid weekly schedule")
+    now_utc = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+    days_since = (now_utc.weekday() - weekday) % 7
+    target_date = now_utc.date() - timedelta(days=days_since)
+    target = datetime.combine(target_date, time(hour_utc), tzinfo=timezone.utc)
+    if target > now_utc:
+        target -= timedelta(days=7)
+    return target.date().isoformat(), target
+
+
+def agent_config(
+    environ: Mapping[str, str] | None = None, *, require_listenbrainz: bool = False
+) -> AgentConfig:
+    """Read operational settings without ever placing credentials in errors."""
+    env = os.environ if environ is None else environ
+    weekday = _schedule_value(env.get("AGENT_WEEKDAY", "0"))
+    hour_utc = _schedule_value(env.get("AGENT_HOUR_UTC", "6"))
+    scheduled_week(datetime(2000, 1, 3, tzinfo=timezone.utc), weekday, hour_utc)
+    playlist_size = _validate_size(env.get("AGENT_PLAYLIST_SIZE", "30"))
+    user = env.get("LISTENBRAINZ_USER") or None
+    token = env.get("LISTENBRAINZ_TOKEN") or None
+    if require_listenbrainz and (not user or not token):
+        raise ValueError("ListenBrainz user and token are required for weekly discovery")
+    return AgentConfig(
+        env.get("MIRASONIC_DB", library.DEFAULT_DB_PATH), user, token,
+        weekday, hour_utc, playlist_size,
+    )
 
 
 def _norm(value: str) -> str:
@@ -209,3 +269,72 @@ def build_rankings(lib, now_ms: int) -> dict:
             for row in playlists
         ],
     }
+
+
+async def daemon(
+    config: AgentConfig,
+    lib,
+    lb,
+    *,
+    now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    sleep: Callable[[float], object] = asyncio.sleep,
+) -> None:
+    """Check hourly and retry the latest scheduled run until it completes."""
+    while True:
+        now = now_fn()
+        week_start, _scheduled = scheduled_week(now, config.weekday, config.hour_utc)
+        run = lib.get_weekly_run(week_start)
+        if run is None or run["status"] != "completed":
+            try:
+                await run_weekly(lib, lb, config.user or "", now, config.playlist_size)
+            except Exception:
+                # Do not include the exception: HTTP clients can contain a token in it.
+                logger.error("weekly agent run failed week_start=%s", week_start)
+        await sleep(3600)
+
+
+async def _run_weekly_command(config: AgentConfig, lib) -> dict:
+    """Run one discovery pass with a short-lived injected HTTP client."""
+    async with httpx.AsyncClient(base_url=LISTENBRAINZ_BASE_URL) as client:
+        lb = ListenBrainzClient(config.token or "", client)
+        return await run_weekly(
+            lib, lb, config.user or "", datetime.now(timezone.utc), config.playlist_size
+        )
+
+
+async def _run_daemon_command(config: AgentConfig, lib) -> None:
+    """Keep the daemon's HTTP client alive for its complete service lifetime."""
+    async with httpx.AsyncClient(base_url=LISTENBRAINZ_BASE_URL) as client:
+        lb = ListenBrainzClient(config.token or "", client)
+        await daemon(config, lib, lb)
+
+
+def cli(argv: list[str] | None = None) -> int:
+    """Command-line entry point for local rankings and scheduled discovery."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("rankings", "weekly", "daemon"))
+    args = parser.parse_args(argv)
+    requires_listenbrainz = args.command in {"weekly", "daemon"}
+    try:
+        config = agent_config(require_listenbrainz=requires_listenbrainz)
+    except ValueError as exc:
+        print(f"configuration error: {exc}", file=os.sys.stderr)
+        return 2
+
+    lib = library.Library(config.db_path)
+    if args.command == "rankings":
+        print(json.dumps(build_rankings(lib, int(datetime.now(timezone.utc).timestamp() * 1000))))
+        return 0
+    try:
+        if args.command == "weekly":
+            asyncio.run(_run_weekly_command(config, lib))
+        else:
+            asyncio.run(_run_daemon_command(config, lib))
+    except Exception:
+        print("weekly agent run failed", file=os.sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

@@ -1,3 +1,6 @@
+import asyncio
+import json
+import logging
 from datetime import datetime, timezone
 
 import httpx
@@ -557,3 +560,162 @@ async def test_weekly_uses_atomic_finalize_once(tmp_path, monkeypatch):
         lib, lb, "listener", datetime(2026, 8, 24, tzinfo=timezone.utc), 30
     )
     assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("now", "expected_week", "expected_scheduled"),
+    [
+        (
+            datetime(2026, 8, 24, 5, 59, tzinfo=timezone.utc),
+            "2026-08-17", datetime(2026, 8, 17, 6, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 8, 24, 6, tzinfo=timezone.utc),
+            "2026-08-24", datetime(2026, 8, 24, 6, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 8, 24, 6, 1, tzinfo=timezone.utc),
+            "2026-08-24", datetime(2026, 8, 24, 6, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 8, 30, 12, tzinfo=timezone.utc),
+            "2026-08-24", datetime(2026, 8, 24, 6, tzinfo=timezone.utc),
+        ),
+    ],
+)
+def test_scheduled_week_uses_most_recent_occurrence(now, expected_week, expected_scheduled):
+    import music_agent
+
+    assert music_agent.scheduled_week(now, weekday=0, hour_utc=6) == (
+        expected_week, expected_scheduled,
+    )
+
+
+@pytest.mark.parametrize("weekday,hour", [(-1, 6), (7, 6), (0, -1), (0, 24)])
+def test_scheduled_week_rejects_invalid_schedule(weekday, hour):
+    import music_agent
+
+    with pytest.raises(ValueError, match="invalid weekly schedule"):
+        music_agent.scheduled_week(datetime(2026, 8, 24, tzinfo=timezone.utc), weekday, hour)
+
+
+@pytest.mark.parametrize("size", ["0", "51", "bad", "1.5"])
+def test_agent_config_rejects_invalid_playlist_size(size):
+    import music_agent
+
+    with pytest.raises(ValueError, match="size must be an integer from 1 to 50"):
+        music_agent.agent_config({"AGENT_PLAYLIST_SIZE": size})
+
+
+@pytest.mark.parametrize("variable", ["LISTENBRAINZ_USER", "LISTENBRAINZ_TOKEN"])
+def test_agent_config_requires_listenbrainz_only_for_discovery(variable):
+    import music_agent
+
+    env = {"MIRASONIC_DB": "/tmp/music.db", "AGENT_PLAYLIST_SIZE": "30"}
+    assert music_agent.agent_config(env).user is None
+    with pytest.raises(ValueError, match="ListenBrainz"):
+        music_agent.agent_config(env, require_listenbrainz=True)
+    env[variable] = "configured"
+    with pytest.raises(ValueError, match="ListenBrainz"):
+        music_agent.agent_config(env, require_listenbrainz=True)
+
+
+@pytest.mark.parametrize("command", ["weekly", "daemon"])
+def test_discovery_commands_fail_clearly_without_listenbrainz(command, tmp_path, monkeypatch, capsys):
+    import music_agent
+
+    monkeypatch.setenv("MIRASONIC_DB", str(tmp_path / "library.db"))
+    monkeypatch.delenv("LISTENBRAINZ_USER", raising=False)
+    monkeypatch.delenv("LISTENBRAINZ_TOKEN", raising=False)
+
+    assert music_agent.cli([command]) == 2
+    assert "ListenBrainz user and token are required" in capsys.readouterr().err
+
+
+def test_rankings_cli_outputs_json_without_listenbrainz(tmp_path, monkeypatch, capsys):
+    import music_agent
+
+    monkeypatch.setenv("MIRASONIC_DB", str(tmp_path / "library.db"))
+    monkeypatch.delenv("LISTENBRAINZ_USER", raising=False)
+    monkeypatch.delenv("LISTENBRAINZ_TOKEN", raising=False)
+
+    assert music_agent.cli(["rankings"]) == 0
+    assert set(json.loads(capsys.readouterr().out)) == {"tracks", "playlists"}
+
+
+def test_weekly_cli_returns_nonzero_when_run_fails(tmp_path, monkeypatch, capsys):
+    import music_agent
+
+    async def fail(*args):
+        raise RuntimeError("upstream unavailable")
+
+    monkeypatch.setenv("MIRASONIC_DB", str(tmp_path / "library.db"))
+    monkeypatch.setenv("LISTENBRAINZ_USER", "listener")
+    monkeypatch.setenv("LISTENBRAINZ_TOKEN", "not-a-real-token")
+    monkeypatch.setattr(music_agent, "_run_weekly_command", fail)
+
+    assert music_agent.cli(["weekly"]) == 1
+    assert "weekly agent run failed" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run", [None, {"status": "running"}, {"status": "failed"}])
+async def test_daemon_catches_up_incomplete_week_and_skips_completed(monkeypatch, run):
+    import music_agent
+
+    config = music_agent.AgentConfig("/tmp/music.db", "listener", "token", 0, 6, 30)
+    now = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
+    calls = []
+
+    class IncompleteLibrary:
+        def get_weekly_run(self, week_start):
+            assert week_start == "2026-08-24"
+            return run
+
+    class CompletedLibrary:
+        def get_weekly_run(self, week_start):
+            return {"status": "completed"}
+
+    async def fake_weekly(lib, lb, user, run_now, size):
+        calls.append((lib, user, run_now, size))
+
+    async def stop_after_one_hour(_):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(music_agent, "run_weekly", fake_weekly)
+    with pytest.raises(asyncio.CancelledError):
+        await music_agent.daemon(config, IncompleteLibrary(), object(), now_fn=lambda: now, sleep=stop_after_one_hour)
+    with pytest.raises(asyncio.CancelledError):
+        await music_agent.daemon(config, CompletedLibrary(), object(), now_fn=lambda: now, sleep=stop_after_one_hour)
+
+    assert len(calls) == 1
+    assert calls[0][1:] == ("listener", now, 30)
+
+
+@pytest.mark.asyncio
+async def test_daemon_logs_generic_failure_and_continues_without_token(monkeypatch, caplog):
+    import music_agent
+
+    secret = "definitely-not-logged"
+    config = music_agent.AgentConfig("/tmp/music.db", "listener", secret, 0, 6, 30)
+
+    class FailedLibrary:
+        def get_weekly_run(self, week_start):
+            return {"status": "running"}
+
+    async def fail(*args):
+        raise RuntimeError(secret)
+
+    async def stop_after_one_hour(_):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(music_agent, "run_weekly", fail)
+    caplog.set_level(logging.ERROR)
+    with pytest.raises(asyncio.CancelledError):
+        await music_agent.daemon(
+            config, FailedLibrary(), object(),
+            now_fn=lambda: datetime(2026, 8, 29, 12, tzinfo=timezone.utc), sleep=stop_after_one_hour,
+        )
+
+    assert "weekly agent run failed week_start=2026-08-24" in caplog.text
+    assert secret not in caplog.text

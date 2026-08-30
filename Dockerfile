@@ -9,7 +9,8 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py subsonic.py library.py spotify_import.py .
+COPY main.py subsonic.py library.py spotify_import.py \
+     ranking.py listenbrainz_client.py music_agent.py ./
 
 # 0.0.0.0, not 127.0.0.1: inside a container loopback is unreachable from
 # outside even with -p 8080:8080. Isolation comes from how the port is
