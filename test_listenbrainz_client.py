@@ -26,7 +26,7 @@ async def test_submit_listens_converts_timestamp_and_metadata():
         await client.submit_listens(
             [
                 {
-                    "played_at_ms": 1_700_000_000_000,
+                    "played_at_ms": 1_700_000_000_000.0,
                     "title": "One",
                     "artist": "Artist",
                     "album": "Album",
@@ -38,6 +38,7 @@ async def test_submit_listens_converts_timestamp_and_metadata():
     assert seen[0].method == "POST"
     assert seen[0].url == "https://api.listenbrainz.org/1/submit-listens"
     assert seen[0].headers["Authorization"] == "Token secret"
+    assert isinstance(body["payload"][0]["listened_at"], int)
     assert body == {
         "listen_type": "import",
         "payload": [
@@ -109,12 +110,18 @@ async def test_recommendations_returns_mbids_and_handles_no_content():
 
 
 @pytest.mark.asyncio
-async def test_recording_metadata_posts_documented_body_and_empty_input_is_a_noop():
+async def test_recording_metadata_normalizes_documented_mapping_and_empty_input_is_a_noop():
     seen = []
 
     def handler(request):
         seen.append(request)
-        return httpx.Response(200, json=[{"recording_mbid": "first"}])
+        return httpx.Response(
+            200,
+            json={
+                "first": {"artist_name": "First Artist"},
+                "second": {"artist_name": "Second Artist"},
+            },
+        )
 
     async with make_client(handler) as http:
         client = ListenBrainzClient("secret", http)
@@ -122,7 +129,10 @@ async def test_recording_metadata_posts_documented_body_and_empty_input_is_a_noo
         metadata = await client.get_recording_metadata(["first", "second"])
 
     assert empty == []
-    assert metadata == [{"recording_mbid": "first"}]
+    assert metadata == [
+        {"artist_name": "First Artist", "recording_mbid": "first"},
+        {"artist_name": "Second Artist", "recording_mbid": "second"},
+    ]
     assert seen[0].method == "POST"
     assert seen[0].url == "https://api.listenbrainz.org/1/metadata/recording/"
     assert json.loads(seen[0].content) == {
@@ -130,6 +140,17 @@ async def test_recording_metadata_posts_documented_body_and_empty_input_is_a_noo
         "inc": "artist release",
     }
     assert "Authorization" not in seen[0].headers
+
+
+@pytest.mark.asyncio
+async def test_recording_metadata_preserves_compatible_list_response():
+    async with make_client(
+        lambda request: httpx.Response(200, json=[{"recording_mbid": "first"}])
+    ) as http:
+        client = ListenBrainzClient("secret", http)
+        metadata = await client.get_recording_metadata(["first"])
+
+    assert metadata == [{"recording_mbid": "first"}]
 
 
 @pytest.mark.asyncio
@@ -179,7 +200,7 @@ async def test_release_tracks_posts_and_normalizes_jspf_tracks():
                             "title": "A Song",
                             "creator": "An Artist",
                             "album": "An Album",
-                            "duration": 243.7,
+                            "duration": 243700,
                             "identifier": "https://musicbrainz.org/recording/12345678-1234-1234-1234-123456789abc",
                         }
                     ]
@@ -202,6 +223,36 @@ async def test_release_tracks_posts_and_normalizes_jspf_tracks():
             "recording_mbid": "12345678-1234-1234-1234-123456789abc",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_release_tracks_finds_recording_uri_in_identifier_array():
+    async with make_client(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "playlist": {
+                    "track": [
+                        {
+                            "title": "Array Song",
+                            "creator": "An Artist",
+                            "album": "An Album",
+                            "duration": 1_000,
+                            "identifier": [
+                                "https://example.invalid/not-a-recording/ignored",
+                                "https://musicbrainz.org/recording/87654321-4321-4321-4321-cba987654321",
+                            ],
+                        }
+                    ]
+                }
+            },
+        )
+    ) as http:
+        client = ListenBrainzClient("secret", http)
+        tracks = await client.get_release_tracks("release-id")
+
+    assert tracks[0]["duration_seconds"] == 1
+    assert tracks[0]["recording_mbid"] == "87654321-4321-4321-4321-cba987654321"
 
 
 @pytest.mark.asyncio

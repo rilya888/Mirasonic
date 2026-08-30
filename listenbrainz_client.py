@@ -8,6 +8,8 @@ https://listenbrainz.readthedocs.io/en/latest/users/api/misc.html
 https://listenbrainz.readthedocs.io/en/latest/users/api/player.html
 """
 
+from urllib.parse import urlparse
+
 import httpx
 
 
@@ -40,7 +42,7 @@ class ListenBrainzClient:
                 metadata["release_name"] = event["album"]
             payload.append(
                 {
-                    "listened_at": event["played_at_ms"] // 1000,
+                    "listened_at": int(event["played_at_ms"] // 1000),
                     "track_metadata": metadata,
                 }
             )
@@ -75,7 +77,13 @@ class ListenBrainzClient:
             json={"recording_mbids": mbids, "inc": "artist release"},
         )
         response.raise_for_status()
-        return response.json()
+        body = response.json()
+        if isinstance(body, list):
+            return body
+        return [
+            {**recording, "recording_mbid": recording_mbid}
+            for recording_mbid, recording in body.items()
+        ]
 
     async def get_fresh_releases(self, user: str, days: int = 14) -> list[dict]:
         """Return personalized recently released music for a user."""
@@ -102,7 +110,7 @@ class ListenBrainzClient:
                 "title": track.get("title"),
                 "artist": track.get("creator"),
                 "album": track.get("album"),
-                "duration_seconds": track.get("duration"),
+                "duration_seconds": self._duration_seconds(track.get("duration")),
                 "recording_mbid": self._recording_mbid(track),
             }
             for track in tracks
@@ -113,8 +121,25 @@ class ListenBrainzClient:
         """Extract a recording MBID from a JSPF MusicBrainz identifier."""
         if track.get("recording_mbid"):
             return track["recording_mbid"]
-        identifier = track.get("identifier", "")
-        marker = "/recording/"
-        if marker not in identifier:
+        identifiers = track.get("identifier", [])
+        if isinstance(identifiers, str):
+            identifiers = [identifiers]
+        if not isinstance(identifiers, list):
             return None
-        return identifier.split(marker, 1)[1].strip("/") or None
+        for identifier in identifiers:
+            if not isinstance(identifier, str):
+                continue
+            parsed = urlparse(identifier)
+            path_parts = parsed.path.strip("/").split("/")
+            if parsed.netloc in {"musicbrainz.org", "www.musicbrainz.org"} and path_parts[:1] == [
+                "recording"
+            ]:
+                return path_parts[1] if len(path_parts) > 1 else None
+        return None
+
+    @staticmethod
+    def _duration_seconds(duration: int | float | None) -> int | float | None:
+        """Convert JSPF millisecond durations into seconds."""
+        if duration is None:
+            return None
+        return duration / 1000
