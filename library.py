@@ -233,35 +233,42 @@ class Library:
         breaks that.
         """
         with self._lock:
-            prow = self._conn.execute(
-                "SELECT id FROM playlists WHERE id = ?", (playlist_id,)
-            ).fetchone()
-            if prow is None:
-                return False
-
-            current = [r["song_id"] for r in self._conn.execute(
-                "SELECT song_id FROM playlist_items WHERE playlist_id = ? ORDER BY position",
-                (playlist_id,),
-            ).fetchall()]
-
-            remove_set = set(remove_indices)
-            kept = [song_id for i, song_id in enumerate(current) if i not in remove_set]
-
-            for song_id, title, artist, album, duration, artwork_url in add_songs:
-                self._insert_song_unlocked(song_id, title, artist, album, duration, artwork_url)
-                kept.append(song_id)
-
-            self._conn.execute("DELETE FROM playlist_items WHERE playlist_id = ?", (playlist_id,))
-            self._conn.executemany(
-                "INSERT INTO playlist_items (playlist_id, position, song_id) VALUES (?, ?, ?)",
-                [(playlist_id, position, song_id) for position, song_id in enumerate(kept)],
+            updated = self._update_playlist_unlocked(
+                playlist_id, name, remove_indices, add_songs
             )
-            self._conn.execute(
-                "UPDATE playlists SET name = ?, changed_at = ? WHERE id = ?",
-                (name, _now_iso(), playlist_id),
-            )
-            self._conn.commit()
-            return True
+            if updated:
+                self._conn.commit()
+            return updated
+
+    def _update_playlist_unlocked(self, playlist_id: int, name: str,
+                                  remove_indices: list[int],
+                                  add_songs: list[tuple]) -> bool:
+        """Update a playlist while the caller owns ``self._lock`` and transaction."""
+        prow = self._conn.execute(
+            "SELECT id FROM playlists WHERE id = ?", (playlist_id,)
+        ).fetchone()
+        if prow is None:
+            return False
+
+        current = [r["song_id"] for r in self._conn.execute(
+            "SELECT song_id FROM playlist_items WHERE playlist_id = ? ORDER BY position",
+            (playlist_id,),
+        ).fetchall()]
+        remove_set = set(remove_indices)
+        kept = [song_id for i, song_id in enumerate(current) if i not in remove_set]
+        for song_id, title, artist, album, duration, artwork_url in add_songs:
+            self._insert_song_unlocked(song_id, title, artist, album, duration, artwork_url)
+            kept.append(song_id)
+        self._conn.execute("DELETE FROM playlist_items WHERE playlist_id = ?", (playlist_id,))
+        self._conn.executemany(
+            "INSERT INTO playlist_items (playlist_id, position, song_id) VALUES (?, ?, ?)",
+            [(playlist_id, position, song_id) for position, song_id in enumerate(kept)],
+        )
+        self._conn.execute(
+            "UPDATE playlists SET name = ?, changed_at = ? WHERE id = ?",
+            (name, _now_iso(), playlist_id),
+        )
+        return True
 
     # -- Spotify mappings -------------------------------------------------
 
@@ -422,6 +429,75 @@ class Library:
             except Exception:
                 self._conn.rollback()
                 raise
+
+    def finalize_weekly_playlist(self, week_start: str, name: str,
+                                 add_songs: list[tuple], items: list[dict]) -> int:
+        """Atomically replace the agent-owned playlist and complete its run.
+
+        Ownership is established exclusively by ``weekly_runs.playlist_id``;
+        the supplied name is never used to select an existing playlist.
+        """
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN")
+                run = self._conn.execute(
+                    "SELECT playlist_id FROM weekly_runs WHERE week_start = ?", (week_start,)
+                ).fetchone()
+                if run is None:
+                    raise ValueError("weekly run does not exist")
+                playlist_id = run["playlist_id"]
+                if playlist_id is None:
+                    created_at = _now_iso()
+                    cursor = self._conn.execute(
+                        "INSERT INTO playlists (name, created_at, changed_at) VALUES (?, ?, ?)",
+                        (name, created_at, created_at),
+                    )
+                    playlist_id = cursor.lastrowid
+                    self._conn.execute(
+                        "UPDATE weekly_runs SET playlist_id = ? WHERE week_start = ?",
+                        (playlist_id, week_start),
+                    )
+                current_count = self._conn.execute(
+                    "SELECT COUNT(*) FROM playlist_items WHERE playlist_id = ?", (playlist_id,)
+                ).fetchone()[0]
+                if not self._update_playlist_unlocked(
+                    playlist_id, name, list(range(current_count)), add_songs
+                ):
+                    raise RuntimeError("agent playlist is missing")
+                self._conn.execute(
+                    "DELETE FROM recommendation_items WHERE week_start = ?", (week_start,)
+                )
+                self._conn.executemany(
+                    "INSERT INTO recommendation_items "
+                    "(week_start, position, song_id, source, recording_mbid, score) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    [(week_start, position, item["song_id"], item["source"],
+                      item.get("recording_mbid"), item["score"])
+                     for position, item in enumerate(items)],
+                )
+                self._conn.execute(
+                    "UPDATE weekly_runs SET status='completed', finished_at=?, error_message=NULL "
+                    "WHERE week_start=?",
+                    (_now_iso(), week_start),
+                )
+                self._conn.commit()
+                return playlist_id
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def get_weekly_recommendation_items(self, week_start: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT position, song_id, source, recording_mbid, score FROM recommendation_items "
+            "WHERE week_start = ? ORDER BY position",
+            (week_start,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_weekly_recommendation_count(self, week_start: str) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM recommendation_items WHERE week_start = ?", (week_start,)
+        ).fetchone()[0]
 
     def fail_weekly_run(self, week_start: str, message: str) -> None:
         with self._lock:

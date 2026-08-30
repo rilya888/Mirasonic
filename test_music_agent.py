@@ -1,9 +1,11 @@
 from datetime import datetime, timezone
 
+import httpx
 import pytest
 
 import library
 import main
+from listenbrainz_client import ListenBrainzClient
 
 
 class FakeListenBrainz:
@@ -152,14 +154,14 @@ async def test_weekly_run_empty_upstream_results_completes_without_playlist(tmp_
 
 
 @pytest.mark.asyncio
-async def test_weekly_run_preserves_user_playlist_with_same_name_and_retries_allocated_agent_playlist(tmp_path, monkeypatch):
+async def test_weekly_run_preserves_user_playlist_after_atomic_finalization_failure(tmp_path, monkeypatch):
     import music_agent
 
     lib = library.Library(str(tmp_path / "library.db"))
     name = "Discoveries — 2026-08-24"
     user_playlist = lib.create_playlist(name)
     lib.update_playlist(user_playlist, name, [], [("user", "Keep", "User", None, 180, None)])
-    lb = FakeListenBrainz([{"recording_mbid": "mbid", "score": 1}], [recording()])
+    lb = FakeListenBrainz([{"recording_mbid": "mbid", "score": 1}], [recording("mbid")])
 
     async def search(**kwargs):
         return {"tracks": [track()], "continuation": None}
@@ -169,24 +171,27 @@ async def test_weekly_run_preserves_user_playlist_with_same_name_and_retries_all
 
     monkeypatch.setattr(main, "search", search)
     monkeypatch.setattr(music_agent.asyncio, "sleep", no_sleep)
-    original_update = lib.update_playlist
+    original_finalize = lib.finalize_weekly_playlist
     calls = 0
 
-    def fail_once(*args, **kwargs):
+    def fail_once(week_start, playlist_name, add_songs, items):
         nonlocal calls
         calls += 1
         if calls == 1:
-            raise RuntimeError("update failed")
-        return original_update(*args, **kwargs)
+            return original_finalize(
+                week_start, playlist_name, add_songs,
+                [{"song_id": "missing", "source": "cf", "score": 1.0}],
+            )
+        return original_finalize(week_start, playlist_name, add_songs, items)
 
-    monkeypatch.setattr(lib, "update_playlist", fail_once)
+    monkeypatch.setattr(lib, "finalize_weekly_playlist", fail_once)
     now = datetime(2026, 8, 24, tzinfo=timezone.utc)
-    with pytest.raises(RuntimeError, match="update failed"):
+    with pytest.raises(Exception):
         await music_agent.run_weekly(lib, lb, "listener", now, 30)
-    allocated_id = lib.get_weekly_run("2026-08-24")["playlist_id"]
+    assert lib.get_weekly_run("2026-08-24")["playlist_id"] is None
     retry = await music_agent.run_weekly(lib, lb, "listener", now, 30)
 
-    assert retry["playlist_id"] == allocated_id
+    assert retry["playlist_id"] == lib.get_weekly_run("2026-08-24")["playlist_id"]
     assert len(lib.get_playlists()) == 2
     assert [song["id"] for song in lib.get_playlist(user_playlist)["songs"]] == ["user"]
 
@@ -339,7 +344,216 @@ async def test_weekly_fresh_releases_are_limited_to_ten_releases_and_two_tracks_
     monkeypatch.setattr(main, "search", search)
     monkeypatch.setattr(music_agent.asyncio, "sleep", no_sleep)
     await music_agent.run_weekly(
-        lib, lb, "listener", datetime(2026, 8, 24, tzinfo=timezone.utc), 500
+        lib, lb, "listener", datetime(2026, 8, 24, tzinfo=timezone.utc), 50
     )
 
     assert searched == [f"Fresh {release}-{position}" for release in range(10) for position in range(2)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [0, -1, 51, "bad", 1.5])
+async def test_invalid_weekly_size_is_rejected_before_creating_run(tmp_path, size):
+    import music_agent
+
+    lib = library.Library(str(tmp_path / "library.db"))
+    with pytest.raises(ValueError):
+        await music_agent.run_weekly(
+            lib, FakeListenBrainz(), "listener", datetime(2026, 8, 24, tzinfo=timezone.utc), size
+        )
+    assert lib.get_weekly_run("2026-08-24") is None
+
+
+@pytest.mark.asyncio
+async def test_weekly_size_fifty_accepts_exactly_fifty_of_more_than_fifty_matches(tmp_path, monkeypatch):
+    import music_agent
+
+    lib = library.Library(str(tmp_path / "library.db"))
+    recommendations = [{"recording_mbid": f"cf-{index}", "score": 100 - index} for index in range(50)]
+    metadata = [recording(f"cf-{index}", f"title{index}", f"artist{index}") for index in range(50)]
+    releases = [{"release_mbid": f"release-{index}"} for index in range(10)]
+    release_tracks = {
+        release["release_mbid"]: [
+            {"title": f"fresh{index}-{track_index}", "artist": f"new{index}", "duration_seconds": 180}
+            for track_index in range(2)
+        ] for index, release in enumerate(releases)
+    }
+    lb = FakeListenBrainz(recommendations, metadata, releases, release_tracks)
+    searched = []
+
+    async def search(q="", **kwargs):
+        artist, title = q.split()
+        searched.append(q)
+        return {"tracks": [track(f"yt-{len(searched)}", title, artist)]}
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(main, "search", search)
+    monkeypatch.setattr(music_agent.asyncio, "sleep", no_sleep)
+    result = await music_agent.run_weekly(
+        lib, lb, "listener", datetime(2026, 8, 24, tzinfo=timezone.utc), 50
+    )
+
+    assert result["added"] == 50
+    assert len(searched) == 50
+    assert len(lib.get_playlist(result["playlist_id"])["songs"]) == 50
+
+
+@pytest.mark.asyncio
+async def test_flat_listenbrainz_metadata_response_flows_into_weekly_orchestration(tmp_path, monkeypatch):
+    import music_agent
+
+    async def handler(request):
+        assert request.url.path == "/1/metadata/recording/"
+        return httpx.Response(200, json={
+            "flat-mbid": {
+                "recording_name": "Flat Song", "artist_name": "Flat Artist",
+                "release_name": "Flat Album", "duration_seconds": 180,
+            }
+        })
+
+    lib = library.Library(str(tmp_path / "library.db"))
+    lb = FakeListenBrainz(recommendations=[{"recording_mbid": "flat-mbid", "score": 7}])
+    async with httpx.AsyncClient(
+        base_url="https://listenbrainz.invalid", transport=httpx.MockTransport(handler)
+    ) as client:
+        lb.get_recording_metadata = ListenBrainzClient("token", client).get_recording_metadata
+
+        async def search(**kwargs):
+            return {"tracks": [track("flat-yt", "Flat Song", "Flat Artist", "Flat Album")]}
+
+        monkeypatch.setattr(main, "search", search)
+        result = await music_agent.run_weekly(
+            lib, lb, "listener", datetime(2026, 8, 24, tzinfo=timezone.utc), 30
+        )
+
+    assert result["added"] == 1
+    assert lib.get_weekly_recommendation_items("2026-08-24") == [
+        {"position": 0, "song_id": "flat-yt", "source": "cf", "recording_mbid": "flat-mbid", "score": 7.0}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_metadata_response_order_cannot_change_recommendation_order_or_scores(tmp_path, monkeypatch):
+    import music_agent
+
+    lib = library.Library(str(tmp_path / "library.db"))
+    lb = FakeListenBrainz(
+        [{"recording_mbid": "first", "score": 9.0}, {"recording_mbid": "second", "score": 3.0}],
+        [recording("second", "Second", "Artist"), recording("first", "First", "Artist")],
+    )
+
+    async def search(q="", **kwargs):
+        title = "First" if "First" in q else "Second"
+        return {"tracks": [track(f"yt-{title.lower()}", title, "Artist")]}
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(main, "search", search)
+    monkeypatch.setattr(music_agent.asyncio, "sleep", no_sleep)
+    result = await music_agent.run_weekly(
+        lib, lb, "listener", datetime(2026, 8, 24, tzinfo=timezone.utc), 2
+    )
+
+    assert [song["id"] for song in lib.get_playlist(result["playlist_id"])["songs"]] == [
+        "yt-first", "yt-second"
+    ]
+    assert lib.get_weekly_recommendation_items("2026-08-24") == [
+        {"position": 0, "song_id": "yt-first", "source": "cf", "recording_mbid": "first", "score": 9.0},
+        {"position": 1, "song_id": "yt-second", "source": "cf", "recording_mbid": "second", "score": 3.0},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_weekly_error_persistence_never_keeps_credential_like_text(tmp_path):
+    import music_agent
+
+    lib = library.Library(str(tmp_path / "library.db"))
+    lb = FakeListenBrainz()
+    lb.token = ""
+
+    async def fail(*args):
+        raise RuntimeError("Bearer abc api_key=xyz password=hunter2 secret=oops")
+
+    lb.get_recommendation_mbids = fail
+    with pytest.raises(RuntimeError):
+        await music_agent.run_weekly(
+            lib, lb, "listener", datetime(2026, 8, 24, tzinfo=timezone.utc), 30
+        )
+    message = lib.get_weekly_run("2026-08-24")["error_message"].lower()
+    assert len(message) <= 500
+    assert all(word not in message for word in ("bearer", "api_key", "password", "secret", "abc", "xyz"))
+    assert "runtimeerror" in message
+
+
+@pytest.mark.asyncio
+async def test_completed_retry_counts_persisted_recommendations_not_later_playlist_edits(tmp_path, monkeypatch):
+    import music_agent
+
+    lib = library.Library(str(tmp_path / "library.db"))
+    lb = FakeListenBrainz([{"recording_mbid": "mbid", "score": 1}], [recording("mbid")])
+
+    async def search(**kwargs):
+        return {"tracks": [track()]}
+
+    monkeypatch.setattr(main, "search", search)
+    now = datetime(2026, 8, 24, tzinfo=timezone.utc)
+    first = await music_agent.run_weekly(lib, lb, "listener", now, 30)
+    lib.update_playlist(first["playlist_id"], "Discoveries — 2026-08-24", [], [
+        ("manual", "Manual", "User", None, 180, None)
+    ])
+    retry = await music_agent.run_weekly(lib, lb, "listener", now, 30)
+
+    assert retry == {"status": "completed", "added": 1, "playlist_id": first["playlist_id"]}
+
+
+@pytest.mark.asyncio
+async def test_naive_datetime_is_treated_as_utc_at_monday_boundary(tmp_path):
+    import music_agent
+
+    sunday = library.Library(str(tmp_path / "sunday.db"))
+    monday = library.Library(str(tmp_path / "monday.db"))
+    await music_agent.run_weekly(sunday, FakeListenBrainz(), "listener", datetime(2026, 8, 30, 23, 30), 30)
+    await music_agent.run_weekly(monday, FakeListenBrainz(), "listener", datetime(2026, 8, 31, 0, 30), 30)
+
+    assert sunday.get_weekly_run("2026-08-24")["status"] == "completed"
+    assert monday.get_weekly_run("2026-08-31")["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_match_candidate_allows_exact_identity_when_duration_is_absent(monkeypatch):
+    import music_agent
+
+    async def search(**kwargs):
+        return {"tracks": [track("no-duration", "One", "Artist", duration=None)]}
+
+    monkeypatch.setattr(main, "search", search)
+    assert await music_agent.match_candidate(
+        {"title": "One", "artist": "Artist", "duration_seconds": None}
+    ) == ("no-duration", "One", "Artist", "New Album", None, None)
+
+
+@pytest.mark.asyncio
+async def test_weekly_uses_atomic_finalize_once(tmp_path, monkeypatch):
+    import music_agent
+
+    lib = library.Library(str(tmp_path / "library.db"))
+    lb = FakeListenBrainz([{"recording_mbid": "mbid", "score": 1}], [recording("mbid")])
+    calls = 0
+    original = lib.finalize_weekly_playlist
+
+    def finalize(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    async def search(**kwargs):
+        return {"tracks": [track()]}
+
+    monkeypatch.setattr(lib, "finalize_weekly_playlist", finalize)
+    monkeypatch.setattr(main, "search", search)
+    await music_agent.run_weekly(
+        lib, lb, "listener", datetime(2026, 8, 24, tzinfo=timezone.utc), 30
+    )
+    assert calls == 1
