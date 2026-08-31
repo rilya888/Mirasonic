@@ -16,6 +16,7 @@ import hmac
 import logging
 import os
 import random
+import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -853,8 +854,67 @@ def _parse_scrobble_time(raw: Optional[str]) -> Optional[int]:
     return value if value >= 0 else None
 
 
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+# The client's current "playing now" track, waiting for the ping that ends it.
+# One listener, one worker process, so a module-level slot is the whole store.
+_playing_now: dict = {}
+
+# How long an unknown-length track has to play before it counts.
+_UNKNOWN_DURATION_THRESHOLD_SECONDS = 120
+
+
+def _listen_threshold_ms(duration) -> Optional[int]:
+    """Last.fm's rule: half the track, capped at four minutes. None means the
+    track can never count — anything under thirty seconds."""
+    if duration is None:
+        return _UNKNOWN_DURATION_THRESHOLD_SECONDS * 1000
+    if duration < 30:
+        return None
+    return int(min(duration / 2, 240) * 1000)
+
+
+async def _note_playing_now(video_id: str, now_ms: int) -> None:
+    """Count the previous track, then remember this one.
+
+    Amperfy sends only submission=false: one ping three seconds into every
+    track and nothing at all when it ends — verified over 23 minutes of
+    uninterrupted playback, 8 tracks, not one submission=true. Taking the ping
+    itself as a listen would count every skip, so a track is credited when the
+    *next* ping arrives and it had been playing long enough.
+
+    ponytail: the pending track lives in memory. A worker restart drops at
+    most the one currently playing, and the last track of a session is
+    credited only when the next one starts. Persisting it would buy one
+    listen at the cost of a table and a migration.
+    """
+    previous = _playing_now.get("current")
+    if previous is not None:
+        threshold = _listen_threshold_ms(previous["meta"].get("duration"))
+        elapsed = now_ms - previous["started_ms"]
+        if threshold is not None and elapsed >= threshold:
+            _get_library().record_listen(
+                {"id": previous["id"], **previous["meta"]}, previous["started_ms"]
+            )
+        elif previous["id"] == video_id:
+            # A repeated ping for the same track — a resume, or the client
+            # simply saying it again. Keep the original start, or the track
+            # would restart its clock and never reach the threshold.
+            return
+    _playing_now["current"] = {
+        "id": video_id,
+        "meta": await _resolve_song_meta(video_id),
+        "started_ms": now_ms,
+    }
+
+
 async def _scrobble(params, request: Request) -> Response:
     if not _submission_is_true(params.get("submission")):
+        ids = params.getlist("id")
+        if ids:
+            await _note_playing_now(ids[0], _now_ms())
         return _ok_response()
     ids = params.getlist("id")
     if not ids:
