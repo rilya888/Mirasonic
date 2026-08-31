@@ -938,12 +938,20 @@ async def _scrobble(params, request: Request) -> Response:
         played_at_ms = _parse_scrobble_time(
             raw_times[index] if index < len(raw_times) else None
         )
-        meta = await _resolve_song_meta(video_id)
-        _get_library().record_listen({"id": video_id, **meta}, played_at_ms)
-        # The client counted it itself, so the pending ping must not count it
-        # again: the two carry different timestamps and would survive the
+        pending = _playing_now.get("current")
+        already_counted = (
+            pending is not None
+            and pending["id"] == video_id
+            and pending["counted"]
+        )
+        # Dropping the pending track is not enough on its own: by the time the
+        # client submits, the re-pings have usually already credited the play.
+        # The two rows carry different timestamps and would survive the
         # UNIQUE(song_id, played_at_ms) as one play recorded twice.
-        if _playing_now.get("current", {}).get("id") == video_id:
+        if not already_counted:
+            meta = await _resolve_song_meta(video_id)
+            _get_library().record_listen({"id": video_id, **meta}, played_at_ms)
+        if pending is not None and pending["id"] == video_id:
             _playing_now.pop("current", None)
     return _ok_response()
 

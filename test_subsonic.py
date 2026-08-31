@@ -1676,3 +1676,24 @@ def test_the_same_track_played_twice_over_counts_twice(lib, monkeypatch):
 
     stats = lib.get_listen_stats(0)
     assert [(row["song_id"], row["listen_count"]) for row in stats] == [("vid-a", 2)]
+
+
+def test_submission_after_the_ping_already_counted_it_adds_nothing(lib, monkeypatch):
+    """The real 15:53 sequence: two pings credit the play, then the client
+    submits the same track. Cancelling the pending entry came too late."""
+    async def meta(video_id):
+        return {"title": video_id, "artist": "Artist", "album": None,
+                "duration": 200, "artwork_url": None}
+
+    monkeypatch.setattr(subsonic, "_resolve_song_meta", meta)
+    start = 1_700_000_000_000
+    _ping("vid-a", start, monkeypatch)
+    _ping("vid-a", start + 120_000, monkeypatch)   # past the threshold: credited
+    client.get(
+        "/rest/scrobble.view",
+        params={**token_params(), "id": "vid-a", "submission": "true"},
+    )
+
+    stats = lib.get_listen_stats(0)
+    assert [row["song_id"] for row in stats] == ["vid-a"]
+    assert stats[0]["listen_count"] == 1
