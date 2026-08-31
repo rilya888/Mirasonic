@@ -15,6 +15,9 @@ services:
       REGION: ${REGION:?set REGION in .env, e.g. US}
       MIRASONIC_DB: /data/mirasonic.db
       HOME: /tmp
+      # Docker captures a pipe, not a tty: without this the logs arrive in 8KB
+      # bursts, which makes them useless for watching a live session.
+      PYTHONUNBUFFERED: "1"
       HOST: 0.0.0.0
       PORT: 8080
     restart: unless-stopped
@@ -54,6 +57,7 @@ services:
       AGENT_HOUR_UTC: ${AGENT_HOUR_UTC:-6}
       AGENT_PLAYLIST_SIZE: ${AGENT_PLAYLIST_SIZE:-30}
       HOME: /tmp
+      PYTHONUNBUFFERED: "1"
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true

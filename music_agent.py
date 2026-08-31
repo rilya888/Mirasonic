@@ -352,6 +352,15 @@ def cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("rankings", "weekly", "daemon"))
     args = parser.parse_args(argv)
+    # Without a handler the daemon's logger drops everything below WARNING, so
+    # a container that is syncing listens hourly looks identical to one that
+    # has silently stopped. rankings prints JSON to stdout — keep it clean.
+    if args.command != "rankings":
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+            stream=os.sys.stderr,
+        )
     requires_listenbrainz = args.command in {"weekly", "daemon"}
     try:
         config = agent_config(require_listenbrainz=requires_listenbrainz)
