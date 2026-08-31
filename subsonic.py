@@ -926,6 +926,11 @@ async def _scrobble(params, request: Request) -> Response:
         )
         meta = await _resolve_song_meta(video_id)
         _get_library().record_listen({"id": video_id, **meta}, played_at_ms)
+        # The client counted it itself, so the pending ping must not count it
+        # again: the two carry different timestamps and would survive the
+        # UNIQUE(song_id, played_at_ms) as one play recorded twice.
+        if _playing_now.get("current", {}).get("id") == video_id:
+            _playing_now.pop("current", None)
     return _ok_response()
 
 

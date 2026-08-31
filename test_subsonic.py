@@ -1621,3 +1621,24 @@ def test_album_list2_keeps_a_single_track_album_with_a_different_name(library_so
     names = [a.get("name") for a in listed.findall(".//s:album", _NS)]
     assert "Раскраски для взрослых" in names   # 1 song, different name — stays
     assert "Одинокая песня" not in names       # single with no album — substituted
+
+
+def test_real_submission_cancels_the_pending_ping(lib, monkeypatch):
+    """Amperfy occasionally does send submission=true. The play it reports must
+    not also be credited by the next playing-now ping."""
+    async def meta(video_id):
+        return {"title": video_id, "artist": "Artist", "album": None,
+                "duration": 200, "artwork_url": None}
+
+    monkeypatch.setattr(subsonic, "_resolve_song_meta", meta)
+    start = 1_700_000_000_000
+    _ping("vid-a", start, monkeypatch)
+    client.get(
+        "/rest/scrobble.view",
+        params={**token_params(), "id": "vid-a", "submission": "true"},
+    )
+    _ping("vid-b", start + 200_000, monkeypatch)  # vid-a is already accounted for
+
+    stats = lib.get_listen_stats(0)
+    assert [row["song_id"] for row in stats] == ["vid-a"]
+    assert stats[0]["listen_count"] == 1
