@@ -150,6 +150,39 @@ def test_begin_weekly_run_creates_running_and_retry_preserves_playlist_id(tmp_pa
     assert retry["playlist_id"] == playlist_id
 
 
+def test_weekly_claim_blocks_parallel_run_and_late_failure_cannot_overwrite_completion(tmp_path):
+    path = tmp_path / "library.db"
+    first_lib = library.Library(str(path))
+    second_lib = library.Library(str(path))
+    week_start = "2026-08-24"
+
+    first_claim = first_lib.begin_weekly_run(week_start)
+    blocked_claim = second_lib.begin_weekly_run(week_start)
+
+    assert first_claim["claimed"] is True
+    assert blocked_claim["claimed"] is False
+
+    # A crashed worker becomes retryable after its lease expires.
+    first_lib._conn.execute(
+        "UPDATE weekly_runs SET lease_until_ms = 0 WHERE week_start = ?", (week_start,)
+    )
+    first_lib._conn.commit()
+    retry_claim = second_lib.begin_weekly_run(week_start)
+    assert retry_claim["claimed"] is True
+    assert retry_claim["claim_token"] != first_claim["claim_token"]
+
+    second_lib.complete_weekly_run(
+        week_start, None, [], claim_token=retry_claim["claim_token"]
+    )
+    first_lib.fail_weekly_run(
+        week_start, "late failure", claim_token=first_claim["claim_token"]
+    )
+
+    run = first_lib.get_weekly_run(week_start)
+    assert run["status"] == "completed"
+    assert run["error_message"] is None
+
+
 def test_complete_weekly_run_replaces_items_and_completes_atomically(tmp_path):
     lib = library.Library(str(tmp_path / "library.db"))
     playlist_id = lib.create_playlist("Discoveries — 2026-08-24")

@@ -25,8 +25,8 @@ Mirasonic  (FastAPI, your machine)
      └─ stream   → yt-dlp resolve, bytes proxied and repacked as ADTS
 ```
 
-- **Single Python service.** One `docker compose up`. About 2,200 lines of
-  code, 149 tests, one SQLite file.
+- **Small Python services.** One playback worker by default, plus an opt-in
+  weekly recommendation agent. About 2,200 lines of code, 249 tests, one SQLite file.
 - **Nothing is written to disk except the library.** The container runs
   `read_only: true`. Audio is never stored anywhere.
 - **Anonymous upstream.** Not a single cookie leaves this server toward
@@ -101,8 +101,10 @@ WireGuard VPN or a reverse proxy terminating TLS works just as well.
 | `AGENT_HOUR_UTC` | `6` | UTC hour at which the weekly discovery run is due. |
 | `AGENT_PLAYLIST_SIZE` | `30` | Number of discoveries to add, from `1` through `50`. |
 
-There are no defaults for the credentials. Without them the server refuses to
-start rather than letting anything through.
+There are no defaults for the required Subsonic credentials. Without
+`SUBSONIC_USER` and `SUBSONIC_PASSWORD` the playback server refuses to start
+rather than letting anything through. ListenBrainz credentials are optional
+and are required only when the `agent` profile or its discovery commands run.
 
 ## Weekly music discovery
 
@@ -201,7 +203,7 @@ Details, scoring and the re-import model: [docs/SPOTIFY-IMPORT.md](docs/SPOTIFY-
 
 ```sh
 pip install -r requirements.txt
-python -m pytest -q            # 149 tests, no network
+python -m pytest -q            # 249 tests, no network
 python -m pytest -m live       # hits YouTube for real
 ```
 

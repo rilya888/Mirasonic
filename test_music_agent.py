@@ -87,6 +87,29 @@ async def test_weekly_run_creates_one_deterministic_playlist(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_parallel_weekly_run_does_not_repeat_external_calls(tmp_path):
+    import music_agent
+
+    path = tmp_path / "library.db"
+    active_lib = library.Library(str(path))
+    competing_lib = library.Library(str(path))
+    active_lib.begin_weekly_run("2026-08-24")
+
+    class NoExternalCalls(FakeListenBrainz):
+        async def get_recommendation_mbids(self, user, count):
+            raise AssertionError("competing run must stop before external calls")
+
+    lb = NoExternalCalls()
+
+    result = await music_agent.run_weekly(
+        competing_lib, lb, "listener", datetime(2026, 8, 24, tzinfo=timezone.utc), 30
+    )
+
+    assert result == {"status": "running", "added": 0, "playlist_id": None}
+    assert lb.submitted == []
+
+
+@pytest.mark.asyncio
 async def test_weekly_run_skips_known_library_song_including_playlist_only_song(tmp_path, monkeypatch):
     import music_agent
 
@@ -178,15 +201,18 @@ async def test_weekly_run_preserves_user_playlist_after_atomic_finalization_fail
     original_finalize = lib.finalize_weekly_playlist
     calls = 0
 
-    def fail_once(week_start, playlist_name, add_songs, items):
+    def fail_once(week_start, playlist_name, add_songs, items, claim_token=None):
         nonlocal calls
         calls += 1
         if calls == 1:
             return original_finalize(
                 week_start, playlist_name, add_songs,
                 [{"song_id": "missing", "source": "cf", "score": 1.0}],
+                claim_token=claim_token,
             )
-        return original_finalize(week_start, playlist_name, add_songs, items)
+        return original_finalize(
+            week_start, playlist_name, add_songs, items, claim_token=claim_token
+        )
 
     monkeypatch.setattr(lib, "finalize_weekly_playlist", fail_once)
     now = datetime(2026, 8, 24, tzinfo=timezone.utc)

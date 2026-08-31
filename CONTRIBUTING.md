@@ -1,7 +1,8 @@
 # Contributing to Mirasonic
 
 Thanks for helping improve Mirasonic. The project deliberately stays small: one
-listener, one library, and one Python service.
+listener, one SQLite library, one playback service, and one optional persistent
+Python service for weekly recommendations.
 
 ## Before opening an issue
 

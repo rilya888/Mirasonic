@@ -8,6 +8,7 @@ main.get_song_details) and passes finished values in. library.py knows only
 about SQLite.
 """
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -15,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 DEFAULT_DB_PATH = "/data/mirasonic.db"
+WEEKLY_RUN_LEASE_MS = 30 * 60 * 1000
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS songs (
@@ -75,7 +77,9 @@ CREATE TABLE IF NOT EXISTS weekly_runs (
   playlist_id    INTEGER REFERENCES playlists(id) ON DELETE SET NULL,
   started_at     TEXT NOT NULL,
   finished_at    TEXT,
-  error_message  TEXT
+  error_message  TEXT,
+  claim_token    TEXT,
+  lease_until_ms INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS recommendation_items (
@@ -121,7 +125,19 @@ class Library:
         self._conn.execute("PRAGMA journal_mode = WAL")  # reader and writer stop blocking each other
         self._conn.execute("PRAGMA busy_timeout = 5000")  # wait for another transaction instead of failing
         self._conn.executescript(SCHEMA)
-        self._conn.commit()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            columns = {
+                row["name"] for row in self._conn.execute("PRAGMA table_info(weekly_runs)")
+            }
+            if "claim_token" not in columns:
+                self._conn.execute("ALTER TABLE weekly_runs ADD COLUMN claim_token TEXT")
+            if "lease_until_ms" not in columns:
+                self._conn.execute("ALTER TABLE weekly_runs ADD COLUMN lease_until_ms INTEGER")
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
         self._lock = threading.Lock()
 
     # -- songs ---------------------------------------------------------
@@ -379,22 +395,41 @@ class Library:
 
     def begin_weekly_run(self, week_start: str) -> dict:
         with self._lock:
-            existing = self._conn.execute(
-                "SELECT * FROM weekly_runs WHERE week_start = ?", (week_start,)
-            ).fetchone()
-            if existing is not None and existing["status"] == "completed":
-                return dict(existing)
-            now = _now_iso()
-            self._conn.execute(
-                "INSERT INTO weekly_runs (week_start, status, started_at) VALUES (?, 'running', ?) "
-                "ON CONFLICT(week_start) DO UPDATE SET status='running', started_at=excluded.started_at, "
-                "finished_at=NULL, error_message=NULL",
-                (week_start, now),
-            )
-            self._conn.commit()
-            return dict(self._conn.execute(
-                "SELECT * FROM weekly_runs WHERE week_start = ?", (week_start,)
-            ).fetchone())
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                existing = self._conn.execute(
+                    "SELECT * FROM weekly_runs WHERE week_start = ?", (week_start,)
+                ).fetchone()
+                now_ms = _now_ms()
+                if existing is not None and (
+                    existing["status"] == "completed"
+                    or (existing["status"] == "running"
+                        and (existing["lease_until_ms"] or 0) > now_ms)
+                ):
+                    result = dict(existing)
+                    result["claimed"] = False
+                    self._conn.commit()
+                    return result
+                now = _now_iso()
+                claim_token = secrets.token_urlsafe(24)
+                self._conn.execute(
+                    "INSERT INTO weekly_runs "
+                    "(week_start, status, started_at, claim_token, lease_until_ms) "
+                    "VALUES (?, 'running', ?, ?, ?) "
+                    "ON CONFLICT(week_start) DO UPDATE SET status='running', "
+                    "started_at=excluded.started_at, finished_at=NULL, error_message=NULL, "
+                    "claim_token=excluded.claim_token, lease_until_ms=excluded.lease_until_ms",
+                    (week_start, now, claim_token, now_ms + WEEKLY_RUN_LEASE_MS),
+                )
+                result = dict(self._conn.execute(
+                    "SELECT * FROM weekly_runs WHERE week_start = ?", (week_start,)
+                ).fetchone())
+                result["claimed"] = True
+                self._conn.commit()
+                return result
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def set_weekly_run_playlist(self, week_start: str, playlist_id: int) -> None:
         """Persist agent ownership immediately after allocating a playlist."""
@@ -406,9 +441,16 @@ class Library:
             self._conn.commit()
 
     def complete_weekly_run(self, week_start: str, playlist_id: Optional[int],
-                            items: list[dict]) -> None:
+                            items: list[dict], claim_token: Optional[str] = None) -> bool:
         with self._lock:
             try:
+                self._conn.execute("BEGIN")
+                if claim_token is not None and self._conn.execute(
+                    "SELECT 1 FROM weekly_runs WHERE week_start=? AND status='running' "
+                    "AND claim_token=?", (week_start, claim_token)
+                ).fetchone() is None:
+                    self._conn.rollback()
+                    raise RuntimeError("weekly run claim is no longer active")
                 self._conn.execute(
                     "DELETE FROM recommendation_items WHERE week_start = ?", (week_start,)
                 )
@@ -426,12 +468,14 @@ class Library:
                     (playlist_id, _now_iso(), week_start),
                 )
                 self._conn.commit()
+                return True
             except Exception:
                 self._conn.rollback()
                 raise
 
     def finalize_weekly_playlist(self, week_start: str, name: str,
-                                 add_songs: list[tuple], items: list[dict]) -> int:
+                                 add_songs: list[tuple], items: list[dict],
+                                 claim_token: Optional[str] = None) -> int:
         """Atomically replace the agent-owned playlist and complete its run.
 
         Ownership is established exclusively by ``weekly_runs.playlist_id``;
@@ -441,10 +485,16 @@ class Library:
             try:
                 self._conn.execute("BEGIN")
                 run = self._conn.execute(
-                    "SELECT playlist_id FROM weekly_runs WHERE week_start = ?", (week_start,)
+                    "SELECT playlist_id, status, claim_token FROM weekly_runs WHERE week_start = ?",
+                    (week_start,),
                 ).fetchone()
                 if run is None:
                     raise ValueError("weekly run does not exist")
+                if claim_token is not None and (
+                    run["status"] != "running" or run["claim_token"] != claim_token
+                ):
+                    self._conn.rollback()
+                    raise RuntimeError("weekly run claim is no longer active")
                 playlist_id = run["playlist_id"]
                 if playlist_id is None:
                     created_at = _now_iso()
@@ -499,14 +549,17 @@ class Library:
             "SELECT COUNT(*) FROM recommendation_items WHERE week_start = ?", (week_start,)
         ).fetchone()[0]
 
-    def fail_weekly_run(self, week_start: str, message: str) -> None:
+    def fail_weekly_run(self, week_start: str, message: str,
+                        claim_token: Optional[str] = None) -> bool:
         with self._lock:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "UPDATE weekly_runs SET status='failed', finished_at=?, error_message=? "
-                "WHERE week_start=?",
-                (_now_iso(), message[:500], week_start),
+                "WHERE week_start=? AND status='running' "
+                "AND (? IS NULL OR claim_token=?)",
+                (_now_iso(), message[:500], week_start, claim_token, claim_token),
             )
             self._conn.commit()
+            return cursor.rowcount == 1
 
     def get_playlist_song_ids(self) -> list[dict]:
         playlists = self.get_playlists()

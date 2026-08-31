@@ -193,7 +193,12 @@ async def run_weekly(
     if existing is not None and existing["status"] == "completed":
         return _completed_result(lib, existing)
 
-    lib.begin_weekly_run(week_start)
+    claim = lib.begin_weekly_run(week_start)
+    if not claim["claimed"]:
+        if claim["status"] == "completed":
+            return _completed_result(lib, claim)
+        return {"status": "running", "added": 0, "playlist_id": claim["playlist_id"]}
+    claim_token = claim["claim_token"]
     try:
         await sync_unsent_listens(lib, lb, int(now_utc.timestamp() * 1000))
         recommendations = await lb.get_recommendation_mbids(user, 50) or []
@@ -251,7 +256,7 @@ async def run_weekly(
                 await asyncio.sleep(0.3)
 
         if not accepted:
-            lib.complete_weekly_run(week_start, None, [])
+            lib.complete_weekly_run(week_start, None, [], claim_token=claim_token)
             return {"status": "completed", "added": 0, "playlist_id": None}
 
         name = f"Discoveries — {week_start}"
@@ -261,10 +266,12 @@ async def run_weekly(
              "recording_mbid": candidate.get("recording_mbid"), "score": candidate["score"]}
             for candidate, matched in accepted
         ]
-        playlist_id = lib.finalize_weekly_playlist(week_start, name, add_songs, items)
+        playlist_id = lib.finalize_weekly_playlist(
+            week_start, name, add_songs, items, claim_token=claim_token
+        )
         return {"status": "completed", "added": len(accepted), "playlist_id": playlist_id}
     except Exception as exc:
-        lib.fail_weekly_run(week_start, _safe_error(exc))
+        lib.fail_weekly_run(week_start, _safe_error(exc), claim_token=claim_token)
         raise
 
 
