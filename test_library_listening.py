@@ -69,12 +69,10 @@ def test_opening_legacy_library_preserves_playlist_data_and_adds_agent_tables(tm
     ).fetchall()
     assert [tuple(row) for row in rows] == expected_rows
     assert [entry["id"] for entry in lib.get_playlist(7)["songs"]] == ["old-2", "old-1"]
-    assert [
-        row[0] for row in lib._conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN "
-            "('listening_events', 'weekly_runs', 'recommendation_items') ORDER BY name"
-        )
-    ] == ["listening_events", "recommendation_items", "weekly_runs"]
+    for table in ("listening_events", "weekly_runs", "recommendation_items"):
+        # Preparing and fetching this query proves the upgraded table is usable,
+        # not merely listed in sqlite_master.
+        assert lib._conn.execute(f"SELECT * FROM {table} LIMIT 0").fetchall() == []
 
 
 def test_record_listen_is_idempotent_for_explicit_timestamp(tmp_path):
