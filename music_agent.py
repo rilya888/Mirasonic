@@ -309,7 +309,10 @@ async def daemon(
         # early there, so scrobbles played after it would sit unsent for days.
         # Its own try — a ListenBrainz outage must not also skip discovery.
         try:
-            await sync_unsent_listens(lib, lb, int(now.timestamp() * 1000))
+            # The only line the healthy loop prints: without it a daemon that has
+            # nothing to send is indistinguishable from one that died.
+            sent = await sync_unsent_listens(lib, lb, int(now.timestamp() * 1000))
+            logger.info("listen sync ok sent=%d", sent)
         except Exception as exc:
             logger.error("listen sync failed error_type=%s", type(exc).__name__)
         try:

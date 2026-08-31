@@ -920,3 +920,29 @@ async def test_daemon_still_runs_discovery_when_listen_sync_fails(monkeypatch, c
     assert calls == ["2026-08-24"]
     assert "listen sync failed error_type=RuntimeError" in caplog.text
     assert "secret-value" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_daemon_reports_a_successful_sync(tmp_path, caplog):
+    """A healthy loop has to say so: silence used to mean either working or dead."""
+    import music_agent
+
+    lib = library.Library(str(tmp_path / "library.db"))
+    lib.record_listen(
+        {"id": "song-1", "title": "Song", "artist": "Artist", "album": None, "duration": 210},
+        1788175752019,
+    )
+    config = music_agent.AgentConfig(str(tmp_path / "library.db"), "listener", "token", 0, 6, 30)
+
+    async def stop_after_one_hour(_):
+        raise asyncio.CancelledError
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(asyncio.CancelledError):
+            await music_agent.daemon(
+                config, lib, FakeListenBrainz(),
+                now_fn=lambda: datetime(2026, 8, 26, 12, tzinfo=timezone.utc),
+                sleep=stop_after_one_hour,
+            )
+
+    assert "listen sync ok sent=1" in caplog.text
