@@ -1642,3 +1642,37 @@ def test_real_submission_cancels_the_pending_ping(lib, monkeypatch):
     stats = lib.get_listen_stats(0)
     assert [row["song_id"] for row in stats] == ["vid-a"]
     assert stats[0]["listen_count"] == 1
+
+
+def test_a_track_re_pinged_while_playing_is_counted_once(lib, monkeypatch):
+    """Amperfy re-pings the playing track about once a minute. Past the
+    threshold every one of those pings used to start a fresh play."""
+    async def meta(video_id):
+        return {"title": video_id, "artist": "Artist", "album": None,
+                "duration": 231, "artwork_url": None}
+
+    monkeypatch.setattr(subsonic, "_resolve_song_meta", meta)
+    start = 1_700_000_000_000
+    for offset in (0, 48_000, 105_000, 155_000):   # the real 15:06 sequence
+        _ping("vid-a", start + offset, monkeypatch)
+    _ping("vid-b", start + 303_000, monkeypatch)
+
+    stats = lib.get_listen_stats(0)
+    assert [(row["song_id"], row["listen_count"]) for row in stats] == [("vid-a", 1)]
+
+
+def test_the_same_track_played_twice_over_counts_twice(lib, monkeypatch):
+    """A repeat ping past the track's own length is a second play, not the
+    client repeating itself."""
+    async def meta(video_id):
+        return {"title": video_id, "artist": "Artist", "album": None,
+                "duration": 185, "artwork_url": None}
+
+    monkeypatch.setattr(subsonic, "_resolve_song_meta", meta)
+    start = 1_700_000_000_000
+    _ping("vid-a", start, monkeypatch)
+    _ping("vid-a", start + 190_000, monkeypatch)   # first play is over
+    _ping("vid-b", start + 380_000, monkeypatch)
+
+    stats = lib.get_listen_stats(0)
+    assert [(row["song_id"], row["listen_count"]) for row in stats] == [("vid-a", 2)]

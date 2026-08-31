@@ -892,22 +892,36 @@ async def _note_playing_now(video_id: str, now_ms: int) -> None:
     """
     previous = _playing_now.get("current")
     if previous is not None:
-        threshold = _listen_threshold_ms(previous["meta"].get("duration"))
         elapsed = now_ms - previous["started_ms"]
-        if threshold is not None and elapsed >= threshold:
+        threshold = _listen_threshold_ms(previous["meta"].get("duration"))
+        if not previous["counted"] and threshold is not None and elapsed >= threshold:
             _get_library().record_listen(
                 {"id": previous["id"], **previous["meta"]}, previous["started_ms"]
             )
-        elif previous["id"] == video_id:
-            # A repeated ping for the same track — a resume, or the client
-            # simply saying it again. Keep the original start, or the track
-            # would restart its clock and never reach the threshold.
+            previous["counted"] = True
+        if previous["id"] == video_id and not _restarted(previous, elapsed):
+            # The same track still playing: Amperfy re-pings it about once a
+            # minute. Keep the original start and the counted flag, or one play
+            # is credited again on every ping past the threshold.
             return
     _playing_now["current"] = {
         "id": video_id,
         "meta": await _resolve_song_meta(video_id),
         "started_ms": now_ms,
+        "counted": False,
     }
+
+
+def _restarted(previous: dict, elapsed_ms: int) -> bool:
+    """Whether a repeated ping for the same track is a second play rather than
+    the client repeating itself: it can only be one once the track has had time
+    to finish.
+
+    ponytail: an unknown duration never counts as a restart, so a track with no
+    metadata on repeat-one is credited once per session. Fixing that needs real
+    playback position, which the Subsonic ping does not carry."""
+    duration = previous["meta"].get("duration")
+    return duration is not None and elapsed_ms >= duration * 1000
 
 
 async def _scrobble(params, request: Request) -> Response:
