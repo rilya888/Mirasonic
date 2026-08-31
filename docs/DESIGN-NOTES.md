@@ -152,6 +152,12 @@ ListenBrainz requires an account.
 **Cost:** no canonical album grouping and no release dates. Acceptable — the
 price would be fuzzy title/artist matching and a one-request-per-second limit.
 
+**Narrowed by D-016.** This decision still holds for the playback path: nothing
+there consults an external catalogue, and metadata still comes from InnerTube
+alone. The clause "ListenBrainz requires an account" was a reason to keep it
+out of playback, not a permanent ban — the optional discovery agent does use
+it, off by default and never in the path that serves audio.
+
 ## D-014 — Duration comes from cheap sources, never from a resolve
 
 **Superseded in part.** This decision originally required resolving every track
@@ -190,3 +196,46 @@ smaller.
 
 **Not permanent:** worth revisiting once there are real numbers on resolve
 volume. Decide by measurement, not by worry.
+
+## D-016 — ListenBrainz, and why it is opt-in
+
+**Decision:** the weekly discovery agent uses ListenBrainz for recommendations
+and fresh releases. It ships as a separate container behind the compose profile
+`agent`, off unless explicitly started, and the playback server neither imports
+it nor needs its credentials.
+
+**Why this decision needed making at all:** until now the project talked to
+exactly one outside party, YouTube, and did so with no account and no cookie.
+The agent adds a second one and sends it your listening history under an
+account you create there. That is a real change in the project's shape, not an
+implementation detail, and it should be a choice rather than a default.
+
+Hence the split. `docker compose up -d` starts playback only and reaches
+nothing but YouTube. `docker compose --profile agent up -d` is a separate,
+deliberate act.
+
+**Why ListenBrainz and not something else:** it is the only recommendation
+source that fits the project's constraints. It is open, its API is documented
+and stable, and an account there is not a Google account — the anonymity that
+matters here is anonymity toward YouTube, which is untouched: the agent's
+YouTube requests are the same anonymous searches everything else makes.
+
+MusicBrainz alone has no recommendations and no user data, and Cover Art
+Archive was already rejected for missing recent releases (D-013). Spotify and
+Last.fm would each mean OAuth and a commercial account.
+
+**Why ranking is local:** `ranking.py` never touches the network and does not
+require a ListenBrainz account. Score a library by play counts, recency and
+stars, and you get something useful with no third party at all —
+`music_agent.py rankings` works on a machine that has never sent a listen
+anywhere. Only *discovery*, which by definition needs to know about music you
+do not have, requires the outside service.
+
+**Why the token never reaches disk:** it is read from the environment on each
+run, kept out of `repr` by a dataclass field, and a failed run persists only an
+exception class name. A database that leaks is embarrassing; one that leaks a
+credential is worse.
+
+**Cost:** listening history leaves the machine when the agent is on. Anyone who
+does not want that gets a strictly smaller product — local rankings and no
+discovery — which is the correct trade to offer rather than to make silently.

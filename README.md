@@ -26,7 +26,8 @@ Mirasonic  (FastAPI, your machine)
 ```
 
 - **Small Python services.** One playback worker by default, plus an opt-in
-  weekly recommendation agent. About 2,200 lines of code, 249 tests, one SQLite file.
+  weekly recommendation agent. About 3,100 lines of code, 249 tests, one SQLite
+  file.
 - **Nothing is written to disk except the library.** The container runs
   `read_only: true`. Audio is never stored anywhere.
 - **Anonymous upstream.** Not a single cookie leaves this server toward

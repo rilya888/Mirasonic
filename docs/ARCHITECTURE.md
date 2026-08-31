@@ -13,18 +13,25 @@ Subsonic client
      ▼
 subsonic.py  ── Subsonic layer, XML, auth, library endpoints
      │
-     ├─ library.py   → SQLite: playlists, stars, song metadata
+     ├─ library.py   → SQLite: playlists, stars, song metadata, listens
      └─ main.py      → search, stream resolution, byte proxying
              │
              ├─ search: POST music.youtube.com/youtubei/v1/search (WEB_REMIX, Songs filter)
              ├─ meta:   POST music.youtube.com/youtubei/v1/player (anonymous)
              └─ audio:  yt-dlp → googlevideo.com, bytes proxied through
+
+music_agent.py ── optional weekly discovery, a separate container
+     ├─ ranking.py             → local scoring, no network
+     └─ listenbrainz_client.py → api.listenbrainz.org
 ```
 
 `subsonic.py` knows nothing about yt-dlp or InnerTube; it reuses `main`.
 `library.py` knows nothing about YouTube; it only knows SQL. `main.py` holds
 every YouTube-shaped assumption in the project, which is why a break upstream
 is a one-file fix.
+
+The agent is optional and off by default. Nothing in the playback path imports
+it, and the playback server runs with no ListenBrainz credentials at all.
 
 ## Why a server at all, and why it proxies bytes
 
@@ -150,6 +157,71 @@ which reads as a bot and earns a captcha ([PITFALLS.md](PITFALLS.md) #1).
 | 404 | not available anonymously (region, age, privacy) |
 | 502 | resolution failed |
 
+## Weekly discovery agent
+
+Optional, and the only part of the project that talks to a third party. It runs
+as a separate container behind the compose profile `agent`; without that
+profile it never starts and its credentials are never needed.
+
+What it does once a week:
+
+1. **Sends unsynced listens to ListenBrainz** in batches of 100, marking each
+   batch synced only after the submission succeeds.
+2. **Asks for recommendations** (`/1/cf/recommendation/user/{user}/recording`),
+   resolves the returned MBIDs to titles and artists through
+   `/1/metadata/recording/`.
+3. **Adds fresh releases** (`/1/user/{user}/fresh_releases`, 14 days), taking
+   at most 10 releases and 2 tracks from each.
+4. **Drops anything already in the library**, compared on normalised
+   (artist, title).
+5. **Matches each candidate on YouTube Music** through the ordinary search
+   path, accepting only an exact normalised title and artist with durations
+   within 12 seconds.
+6. **Writes a playlist** named `Discoveries — {week_start}`.
+
+Only step 5 touches YouTube, and it obeys the same discipline as everything
+else: one search per candidate, 0.3 s apart, and `yt-dlp` is never called.
+
+### Where listens come from
+
+`scrobble` is no longer a stub. When a client reports a play, the Subsonic
+layer records it in `listening_events` with its timestamp, resolving the song's
+metadata first so a track played straight from search still lands in the
+library. Listens are recorded whether or not the agent is enabled — the table
+simply stays unsynced when it is not.
+
+### Idempotency and crash safety
+
+A weekly run must not produce two playlists for one week, and a container that
+dies mid-run must not wedge the week forever. Both are handled in SQL rather
+than in the agent:
+
+- `begin_weekly_run` claims a week under `BEGIN IMMEDIATE`, writing a random
+  `claim_token` and a `lease_until_ms` 30 minutes out. A second process finding
+  a live lease backs off and reports `running`.
+- An expired lease is reclaimable, so a killed run recovers on the next hourly
+  tick rather than blocking the week.
+- The playlist and its `recommendation_items` are written in one transaction
+  that also verifies the claim token, so a run whose lease expired mid-flight
+  cannot commit over a newer one.
+- A completed week short-circuits: the run returns the existing playlist
+  without contacting anyone.
+
+The scheduler checks hourly and computes the most recent past occurrence of
+(`AGENT_WEEKDAY`, `AGENT_HOUR_UTC`), so a restart catches up a missed week
+instead of skipping it.
+
+### Ranking
+
+`ranking.py` is pure local arithmetic — no network, no ListenBrainz account
+required. A track scores `0.60·frequency + 0.25·recency + 0.15·starred`, where
+frequency is `log1p(count)/log1p(30)` and recency decays with a 30-day half
+life. A playlist scores `0.80·mean(track scores) + 0.20·coverage`, coverage
+being the share of its tracks ever listened to.
+
+Ties break on `song_id` and playlist `id`, so the order is deterministic and
+testable.
+
 ## Caches
 
 | Cache | Contents | Bound |
@@ -171,13 +243,20 @@ marked as such in the code.
 
 One SQLite file, `/data/mirasonic.db`, in the only writable mount. The container
 itself stays `read_only: true`. Schema: `songs`, `playlists`, `playlist_items`,
-`starred`, `spotify_map` — see [SUBSONIC.md](SUBSONIC.md) §4.
+`starred`, `spotify_map`, plus `listening_events`, `weekly_runs` and
+`recommendation_items` for the agent — see [SUBSONIC.md](SUBSONIC.md) §4.
 
-The journal is WAL, because there are two writers: the server and the separate
-`spotify_import.py` process. In the default mode the importer would lock the
-whole database and a client would hit `database is locked` mid-song.
+The journal is WAL, because there are up to three writers: the playback server,
+the separate `spotify_import.py` process and the agent container. In the
+default mode any of them would lock the whole database and a client would hit
+`database is locked` mid-song.
 
-Audio is never written to disk.
+Older databases are upgraded in place: missing tables and columns are added on
+open, so a library created before the agent existed keeps working without a
+migration step.
+
+Audio is never written to disk. Listening history is titles and timestamps, and
+it stays in this file unless the agent is switched on.
 
 ## Anti-captcha discipline
 
@@ -190,11 +269,22 @@ private API did.
 - Metadata never goes through yt-dlp. Duration, title, artist and artwork all
   come from search results or from `/youtubei/v1/player`.
 - Bulk operations (the Spotify import) use the same path and pace themselves.
+- The weekly agent matches candidates through ordinary search, one at a time,
+  0.3 s apart, and stops as soon as it has filled the playlist. It never calls
+  `yt-dlp`.
 - Client-side offline caching must be off; the server cannot enforce this.
 
 ## Security and privacy
 
 - No accounts, cookies or authorisation toward YouTube. Ever.
+- **ListenBrainz is the one exception, and it is opt-in.** With the `agent`
+  profile enabled, listening history leaves the machine for
+  `api.listenbrainz.org` under an account you create there. Nothing else is
+  sent, the playback path is untouched, and without the profile no outbound
+  request to anyone but YouTube is ever made. See
+  [DESIGN-NOTES.md](DESIGN-NOTES.md) D-016.
+- The ListenBrainz token is read from the environment, never persisted, and
+  kept out of error messages: a failed run stores only an exception class name.
 - Local Subsonic credentials are checked on every `/rest` request. The protocol
   sends them with each call, so redaction of the uvicorn access log is not
   optional — see [PITFALLS.md](PITFALLS.md) #10.
@@ -204,7 +294,7 @@ private API did.
 
 ## Tests
 
-149 tests, none of which touch the network. Live tests are marked `live` and
+249 tests, none of which touch the network. Live tests are marked `live` and
 deselected by default.
 
 - Search parsing: fixture parsing, ATV filtering, config caching, pagination,
@@ -214,6 +304,14 @@ deselected by default.
 - Subsonic: auth in both token and plaintext forms, every endpoint's XML shape,
   playlist reordering semantics, the derived artist/album tabs, credential
   redaction in logs.
-- Library: insert-fills-gaps behaviour, playlist ordering, cascade deletes.
+- Library: insert-fills-gaps behaviour, playlist ordering, cascade deletes,
+  in-place upgrade of a database created before the agent existed.
 - Import: scoring thresholds against real mismatches, CSV parsing, re-import
   idempotency, manual mapping.
+- Agent: schedule arithmetic including a missed week, claim/lease
+  serialisation of concurrent runs, atomic playlist finalisation, candidate
+  matching and its rejection cases, listen batching and sync marking, and that
+  a failure persists no credentials.
+- Ranking: score arithmetic and deterministic tie-breaking.
+- ListenBrainz client: request shapes, MBID extraction, and tolerance of the
+  several response shapes the API returns.

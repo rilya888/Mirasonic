@@ -213,6 +213,51 @@ CREATE TABLE spotify_map (
 );
 ```
 
+Three more tables belong to the optional weekly discovery agent. They are
+created whether or not the agent runs — `scrobble` fills the first one from
+ordinary playback — but nothing reads them until it is enabled.
+
+```sql
+-- Every play a client reported through scrobble.
+CREATE TABLE listening_events (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  song_id             TEXT NOT NULL REFERENCES songs(id),
+  played_at_ms        INTEGER NOT NULL,
+  external_sent_at_ms INTEGER,          -- NULL until sent to ListenBrainz
+  created_at          TEXT NOT NULL,
+  UNIQUE(song_id, played_at_ms)         -- a replayed scrobble is not a second listen
+);
+
+-- One row per ISO week. Doubles as the lock that keeps two runs apart.
+CREATE TABLE weekly_runs (
+  week_start     TEXT PRIMARY KEY,      -- ISO Monday
+  status         TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed')),
+  playlist_id    INTEGER REFERENCES playlists(id) ON DELETE SET NULL,
+  started_at     TEXT NOT NULL,
+  finished_at    TEXT,
+  error_message  TEXT,                  -- exception class only, never a token
+  claim_token    TEXT,                  -- random, proves who owns the run
+  lease_until_ms INTEGER                -- 30 min; an expired lease is reclaimable
+);
+
+-- What went into a week's playlist, and why.
+CREATE TABLE recommendation_items (
+  week_start     TEXT NOT NULL REFERENCES weekly_runs(week_start) ON DELETE CASCADE,
+  position       INTEGER NOT NULL,
+  song_id        TEXT NOT NULL REFERENCES songs(id),
+  source         TEXT NOT NULL,         -- 'cf' or 'fresh'
+  recording_mbid TEXT,
+  score          REAL NOT NULL,
+  PRIMARY KEY (week_start, position)
+);
+```
+
+`UNIQUE(song_id, played_at_ms)` matters: clients re-send scrobbles, and without
+it a retried submission would inflate the listen count that ranking depends on.
+
+Databases created before these tables existed are upgraded in place on open —
+missing tables and columns are added, nothing is rewritten.
+
 `spotify_map` is what makes a monthly re-import cheap and predictable: a known
 `spotify:track:…` is not searched again, and a hand-corrected match stays
 corrected. Without it, every run would re-query YouTube for the whole playlist.
@@ -391,6 +436,26 @@ Starred tracks.
 `id` is a song; `albumId` and `artistId` are accepted and ignored. Songs go into
 the `starred` table. Empty success.
 
+### `scrobble.view`
+
+Records a play in `listening_events`. This is the only stub that grew into a
+real endpoint, because the weekly discovery agent needs listening history and
+the client already reports it.
+
+| Parameter | Handling |
+|---|---|
+| `id` | repeated; missing entirely → `<error code="10"/>` |
+| `time` | repeated, positionally paired with `id`; ms since epoch. Absent, unparseable or negative → recorded as now |
+| `submission` | `false`/`0` means "now playing", not a play — accepted and ignored |
+
+The song's metadata is resolved before the row is written, so a track played
+straight from search results enters `songs` rather than leaving a dangling
+reference.
+
+Recording is unconditional: listens accumulate whether or not the agent is
+enabled, and simply stay unsynced. Duplicate submissions of the same
+(song, timestamp) collapse — see §4.
+
 ### `getSong.view?id=`
 
 One track. The library is the first source, the search cache the second — a
@@ -562,7 +627,7 @@ empty contents, which is enough.
 | `getInternetRadioStations` | `<internetRadioStations/>` |
 | `getSimilarSongs2` | `<similarSongs2/>` |
 | `getOpenSubsonicExtensions` | empty success — the client concludes there are none |
-| `scrobble`, `setRating`, `deletePodcastEpisode` | empty success, action ignored |
+| `setRating`, `deletePodcastEpisode` | empty success, action ignored |
 | `getRandomSongs` | a random selection of `size` rows from `songs` |
 | `getMusicDirectory` | `<error code="70"/>` — folder browsing, which Amperfy never calls |
 

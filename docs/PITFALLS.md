@@ -182,3 +182,57 @@ it changes on every request.
 
 Clients page through it until a response comes back empty. Lying about `offset`
 means either losing the tail of the library or looping requests forever.
+
+## 18. A weekly job needs a lock in the database, not in the process
+
+The discovery agent ticks hourly and does one thing per ISO week. "Have I run
+this week?" answered by reading a row and then writing it is a race: two ticks,
+or a tick overlapping a manual `music_agent.py weekly`, both read "no" and both
+build a playlist.
+
+The fix is a claim written under `BEGIN IMMEDIATE`: the winner stamps a random
+`claim_token` and a `lease_until_ms` 30 minutes out, and the loser sees a live
+lease and reports `running`. Because the lock lives in the same SQLite file as
+the data, it also works across processes and containers, which a `asyncio.Lock`
+would not.
+
+## 19. A lock with no expiry turns one crash into a permanent outage
+
+The first version of the claim above had no lease. A container killed mid-run
+left `status = 'running'` forever, and every later tick politely backed off —
+the week was wedged with no error anywhere.
+
+An expired lease is reclaimable, which turns a crash into a delay of at most
+one tick. The commit that writes results also re-checks the claim token, so a
+run whose lease expired mid-flight cannot commit on top of the newer one that
+replaced it.
+
+## 20. Building a playlist is one transaction or it is a mess
+
+Creating the playlist, appending its tracks and recording what went into it are
+three writes. Done separately, a failure in the middle leaves a half-filled
+`Discoveries` playlist that the next run considers already done.
+
+`finalize_weekly_playlist` does all of it inside one `BEGIN`/`commit`, with an
+explicit `rollback` on failure. Either the week has a complete playlist or it
+has nothing and will be retried.
+
+## 21. Scrobbles arrive more than once
+
+Clients re-send them: on retry, on reconnect, on their own schedule. Counting
+each arrival inflates exactly the number that ranking depends on, and the
+inflation is invisible because the playlist still looks plausible.
+
+`UNIQUE(song_id, played_at_ms)` on `listening_events` collapses them. The
+timestamp comes from the client's `time` parameter, so a genuine second play of
+the same track is a different row.
+
+## 22. Async tests that never run are worse than no tests
+
+`pytest-asyncio` was missing from the dev requirements. Every `async def` test
+was collected, skipped with a warning, and reported as passing — the suite was
+green while a hundred assertions never executed. It surfaced only when CI ran
+on a clean machine.
+
+If a test is async, check that removing its assertions actually turns the suite
+red.
