@@ -935,6 +935,11 @@ _LOGGED_VALUES = {
     # tell which albums the client is asking about: the ones the server serves,
     # or ghosts of its own.
     "getAlbum": ("id",),
+    # A scrobble the server answers "ok" and drops is otherwise invisible:
+    # submission=false is a now-playing ping, not a listen. Without the value
+    # in the log, a client that never sends the real submission looks exactly
+    # like one that scrobbles fine.
+    "scrobble": ("id", "submission", "time"),
 }
 
 

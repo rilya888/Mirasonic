@@ -700,6 +700,20 @@ def test_scrobble_submission_values_follow_protocol(lib, monkeypatch, submission
     assert bool(lib.get_listen_stats(0)) is should_count
 
 
+def test_scrobble_logs_submission_without_leaking_credentials(lib, caplog):
+    """An ignored scrobble must be visible: a client that only ever sends
+    now-playing pings otherwise looks identical to one that scrobbles."""
+    with caplog.at_level(logging.INFO, logger="worker.subsonic"):
+        response = client.get("/rest/scrobble.view", params={
+            **token_params(), "id": "vid-1", "submission": "false",
+        })
+
+    assert response.status_code == 200
+    assert "action=scrobble" in caplog.text
+    assert "id=vid-1 submission=false" in caplog.text
+    assert PASSWORD not in caplog.text
+
+
 def test_scrobble_playing_now_does_not_count(lib):
     response = client.get("/rest/scrobble.view", params={
         **token_params(), "id": "vid-1", "submission": "false",
