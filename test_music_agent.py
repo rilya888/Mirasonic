@@ -856,3 +856,67 @@ def test_agent_compose_is_opt_in_and_allows_empty_listenbrainz_credentials():
     assert "profiles: [agent]" in compose
     assert "LISTENBRAINZ_USER: ${LISTENBRAINZ_USER:-}" in compose
     assert "LISTENBRAINZ_TOKEN: ${LISTENBRAINZ_TOKEN:-}" in compose
+
+
+@pytest.mark.asyncio
+async def test_daemon_sends_scrobbles_even_when_the_week_is_already_completed(tmp_path):
+    """The reason sync moved out of run_weekly: a completed week returns early."""
+    import music_agent
+
+    lib = library.Library(str(tmp_path / "library.db"))
+    song = {"id": "song-1", "title": "Old Song", "artist": "Old Artist",
+            "album": "Old Album", "duration": 210}
+    lib.record_listen(song, 1788175752019)
+    config = music_agent.AgentConfig(str(tmp_path / "library.db"), "listener", "token", 0, 6, 30)
+    now = datetime(2026, 8, 26, 12, tzinfo=timezone.utc)
+    lb = FakeListenBrainz()
+
+    async def stop_after_one_hour(_):
+        raise asyncio.CancelledError
+
+    # First pass completes the week; the second finds nothing left to discover.
+    with pytest.raises(asyncio.CancelledError):
+        await music_agent.daemon(config, lib, lb, now_fn=lambda: now, sleep=stop_after_one_hour)
+    assert lib.get_weekly_run("2026-08-24")["status"] == "completed"
+
+    lib.record_listen(song, 1788179352019)
+    with pytest.raises(asyncio.CancelledError):
+        await music_agent.daemon(config, lib, lb, now_fn=lambda: now, sleep=stop_after_one_hour)
+
+    assert [event["played_at_ms"] for batch in lb.submitted for event in batch] == [
+        1788175752019, 1788179352019,
+    ]
+    assert lib.get_unsynced_listens() == []
+
+
+@pytest.mark.asyncio
+async def test_daemon_still_runs_discovery_when_listen_sync_fails(monkeypatch, caplog):
+    import music_agent
+
+    config = music_agent.AgentConfig("/tmp/music.db", "listener", "token", 0, 6, 30)
+    now = datetime(2026, 8, 26, 12, tzinfo=timezone.utc)
+    calls = []
+
+    class Library:
+        def get_unsynced_listens(self, limit=100):
+            raise RuntimeError("token=secret-value")
+
+        def get_weekly_run(self, week_start):
+            return None
+
+    async def fake_weekly(lib, lb, user, run_now, size, *, week_start=None):
+        calls.append(week_start)
+
+    async def stop_after_one_hour(_):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(music_agent, "run_weekly", fake_weekly)
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(asyncio.CancelledError):
+            await music_agent.daemon(
+                config, Library(), object(), now_fn=lambda: now, sleep=stop_after_one_hour
+            )
+
+    assert calls == ["2026-08-24"]
+    assert "listen sync failed error_type=RuntimeError" in caplog.text
+    assert "secret-value" not in caplog.text

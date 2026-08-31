@@ -304,8 +304,15 @@ async def daemon(
     """Check hourly and retry the latest scheduled run until it completes."""
     while True:
         week_start = None
+        now = now_fn()
+        # Hourly, not once a week inside run_weekly: a completed week returns
+        # early there, so scrobbles played after it would sit unsent for days.
+        # Its own try — a ListenBrainz outage must not also skip discovery.
         try:
-            now = now_fn()
+            await sync_unsent_listens(lib, lb, int(now.timestamp() * 1000))
+        except Exception as exc:
+            logger.error("listen sync failed error_type=%s", type(exc).__name__)
+        try:
             week_start, _scheduled = scheduled_week(now, config.weekday, config.hour_utc)
             run = lib.get_weekly_run(week_start)
             if run is None or run["status"] != "completed":
