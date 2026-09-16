@@ -19,3 +19,6 @@ data/
 
 # Local compose overrides
 compose.override.yaml
+
+# Owner-only deploy script
+deploy.sh
