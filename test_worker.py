@@ -370,7 +370,7 @@ class FakeAsyncClient:
     def __init__(self, *args, **kwargs):
         pass
 
-    async def get(self, url, headers=None):
+    async def get(self, url, headers=None, timeout=None):
         FakeAsyncClient.captured_headers = headers
         return httpx.Response(206, content=FakeAsyncClient.body,
                               headers={"content-range": "bytes 0-9/10"})
@@ -380,7 +380,7 @@ class FakeAsyncClient:
 
 
 class FailingAsyncClient(FakeAsyncClient):
-    async def get(self, url, headers=None):
+    async def get(self, url, headers=None, timeout=None):
         raise httpx.ConnectError("boom")
 
 
@@ -564,3 +564,19 @@ def test_live_stream_range_returns_adts_frames():
     head = stream_resp.content
     assert head[0] == 0xFF and head[1] & 0xF0 == 0xF0
     assert b"ftyp" not in head[:64]
+
+
+def test_download_gives_up_after_stalled_reads(monkeypatch):
+    class StalledClient:
+        calls = 0
+
+        async def get(self, url, **kwargs):
+            self.calls += 1
+            assert kwargs["timeout"] is main.DOWNLOAD_TIMEOUT
+            raise httpx.ReadTimeout("stalled")
+
+    client = StalledClient()
+    monkeypatch.setattr(main, "get_upstream_client", lambda: client)
+    with pytest.raises(main.UpstreamError):
+        asyncio.run(main._download("https://example.invalid/track"))
+    assert client.calls == main.DOWNLOAD_ATTEMPTS

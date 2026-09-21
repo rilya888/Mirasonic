@@ -75,6 +75,7 @@ YDL_OPTS = {
     "no_warnings": True,
     "skip_download": True,
     "format": "bestaudio[ext=m4a]/bestaudio",
+    "socket_timeout": 20,
 }
 UNAVAILABLE_MARKERS = (
     "unavailable",
@@ -544,6 +545,9 @@ async def prefetch(video_id: str):
 # frames plus a 7-byte header per frame (+0.7% in size).
 ADTS_CONTENT_TYPE = "audio/aac"
 DOWNLOAD_ATTEMPTS = 3
+# Per-operation (connect/read gap), not total. Measured 2026-09-21: one stalled
+# googlevideo read held _adts_lock for hours and every stream queued behind it.
+DOWNLOAD_TIMEOUT = httpx.Timeout(20)
 ADTS_CACHE_SIZE = 3
 
 # Finished tracks. Repackaging 5 MB costs about a second, and a client makes at
@@ -571,7 +575,8 @@ async def _download(url: str) -> bytes:
     last: Optional[Exception] = None
     for _ in range(DOWNLOAD_ATTEMPTS):
         try:
-            response = await client.get(url, headers={"Range": "bytes=0-"})
+            response = await client.get(
+                url, headers={"Range": "bytes=0-"}, timeout=DOWNLOAD_TIMEOUT)
         except httpx.HTTPError as exc:
             last = exc  # cut off mid-transfer — just refetch, it costs 0.15 s
             continue
