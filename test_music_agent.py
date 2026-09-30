@@ -381,6 +381,45 @@ async def test_weekly_fresh_releases_are_limited_to_ten_releases_and_two_tracks_
 
 
 @pytest.mark.asyncio
+async def test_weekly_skips_a_release_whose_tracks_fail(tmp_path, monkeypatch):
+    # 2026-09: ListenBrainz retired /player/release/ with 410 Gone and every
+    # weekly run since failed outright instead of losing one release.
+    import music_agent
+
+    lib = library.Library(str(tmp_path / "library.db"))
+    lb = FakeListenBrainz(
+        releases=[{"release_mbid": "gone"}, {"release_mbid": "ok"}],
+        release_tracks={"ok": [{"title": "Fresh Song", "artist": "Fresh", "duration_seconds": 180}]},
+    )
+    original = lb.get_release_tracks
+
+    async def get_release_tracks(release_mbid):
+        if release_mbid == "gone":
+            request = httpx.Request("GET", "https://musicbrainz.org/ws/2/release/gone")
+            raise httpx.HTTPStatusError("gone", request=request, response=httpx.Response(410, request=request))
+        return await original(release_mbid)
+
+    lb.get_release_tracks = get_release_tracks
+    searched = []
+
+    async def search(q="", **kwargs):
+        searched.append(q)
+        return {"tracks": []}
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(main, "search", search)
+    monkeypatch.setattr(music_agent.asyncio, "sleep", no_sleep)
+    result = await music_agent.run_weekly(
+        lib, lb, "listener", datetime(2026, 8, 24, tzinfo=timezone.utc), 5
+    )
+
+    assert result["status"] == "completed"
+    assert searched == ["Fresh Fresh Song"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("size", [0, -1, 51, "bad", 1.5])
 async def test_invalid_weekly_size_is_rejected_before_creating_run(tmp_path, size):
     import music_agent

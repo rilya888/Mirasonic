@@ -186,7 +186,7 @@ async def test_fresh_releases_uses_personalized_endpoint_and_payload_shape():
 
 
 @pytest.mark.asyncio
-async def test_release_tracks_posts_and_normalizes_jspf_tracks():
+async def test_release_tracks_reads_musicbrainz_release():
     seen = []
 
     def handler(request):
@@ -194,17 +194,21 @@ async def test_release_tracks_posts_and_normalizes_jspf_tracks():
         return httpx.Response(
             200,
             json={
-                "playlist": {
-                    "track": [
+                "title": "An Album",
+                "media": [
+                    {"tracks": [
                         {
                             "title": "A Song",
-                            "creator": "An Artist",
-                            "album": "An Album",
-                            "duration": 243700,
-                            "identifier": "https://musicbrainz.org/recording/12345678-1234-1234-1234-123456789abc",
+                            "length": 243700,
+                            "artist-credit": [
+                                {"name": "One", "joinphrase": " feat. "},
+                                {"name": "Two", "joinphrase": ""},
+                            ],
+                            "recording": {"id": "12345678-1234-1234-1234-123456789abc"},
                         }
-                    ]
-                }
+                    ]},
+                    {"tracks": [{"title": "Disc Two", "artist-credit": []}]},
+                ],
             },
         )
 
@@ -212,47 +216,27 @@ async def test_release_tracks_posts_and_normalizes_jspf_tracks():
         client = ListenBrainzClient("secret", http)
         tracks = await client.get_release_tracks("release-id")
 
-    assert seen[0].method == "POST"
-    assert seen[0].url == "https://api.listenbrainz.org/player/release/release-id/"
+    assert seen[0].method == "GET"
+    assert seen[0].url.host == "musicbrainz.org"
+    assert seen[0].url.path == "/ws/2/release/release-id"
+    assert "Mirasonic" in seen[0].headers["User-Agent"]
+    assert "Authorization" not in seen[0].headers
     assert tracks == [
         {
             "title": "A Song",
-            "artist": "An Artist",
+            "artist": "One feat. Two",
             "album": "An Album",
             "duration_seconds": 243.7,
             "recording_mbid": "12345678-1234-1234-1234-123456789abc",
-        }
+        },
+        {
+            "title": "Disc Two",
+            "artist": None,
+            "album": "An Album",
+            "duration_seconds": None,
+            "recording_mbid": None,
+        },
     ]
-
-
-@pytest.mark.asyncio
-async def test_release_tracks_finds_recording_uri_in_identifier_array():
-    async with make_client(
-        lambda request: httpx.Response(
-            200,
-            json={
-                "playlist": {
-                    "track": [
-                        {
-                            "title": "Array Song",
-                            "creator": "An Artist",
-                            "album": "An Album",
-                            "duration": 1_000,
-                            "identifier": [
-                                "https://example.invalid/not-a-recording/ignored",
-                                "https://musicbrainz.org/recording/87654321-4321-4321-4321-cba987654321",
-                            ],
-                        }
-                    ]
-                }
-            },
-        )
-    ) as http:
-        client = ListenBrainzClient("secret", http)
-        tracks = await client.get_release_tracks("release-id")
-
-    assert tracks[0]["duration_seconds"] == 1
-    assert tracks[0]["recording_mbid"] == "87654321-4321-4321-4321-cba987654321"
 
 
 @pytest.mark.asyncio

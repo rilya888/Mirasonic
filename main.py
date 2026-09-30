@@ -563,6 +563,10 @@ class UpstreamError(Exception):
     """The URL resolved, but no bytes came out of it."""
 
 
+class UpstreamRefused(UpstreamError):
+    """googlevideo answered with an HTTP error: the signed URL itself is bad."""
+
+
 async def _download(url: str) -> bytes:
     """Pulls the whole track.
 
@@ -581,7 +585,7 @@ async def _download(url: str) -> bytes:
             last = exc  # cut off mid-transfer — just refetch, it costs 0.15 s
             continue
         if response.status_code >= 400:
-            raise UpstreamError(f"upstream {response.status_code}")
+            raise UpstreamRefused(f"upstream {response.status_code}")
         return response.content
     raise UpstreamError(f"upstream unreachable: {last!r}")
 
@@ -606,8 +610,16 @@ async def get_adts(video_id: str) -> bytes:
         cached = _adts_cache.get(video_id)
         if cached is not None:
             return cached
-        url = await get_stream_url(video_id)
-        audio = await _remux_to_adts(await _download(url))
+        try:
+            data = await _download(await get_stream_url(video_id))
+        except UpstreamRefused:
+            # A URL googlevideo refused stays refused until it expires (~6 h).
+            # Measured 2026-09-29: without eviction every retry hit the same
+            # dead URL, the client got 502 after 502, and Amperfy restarted the
+            # current track each time. One fresh resolve usually plays.
+            _stream_cache.pop(video_id, None)
+            data = await _download(await get_stream_url(video_id))
+        audio = await _remux_to_adts(data)
         _adts_cache[video_id] = audio
         while len(_adts_cache) > ADTS_CACHE_SIZE:
             _adts_cache.pop(next(iter(_adts_cache)))  # dict keeps insertion order

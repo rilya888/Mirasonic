@@ -536,6 +536,31 @@ def test_prefetch_then_stream_does_not_resolve_twice(monkeypatch):
     main._stream_cache.clear()
 
 
+def test_stream_refused_url_is_evicted_and_resolved_again(monkeypatch):
+    """2026-09-29: googlevideo 403'd a cached URL and every retry reused it."""
+    main._stream_cache.clear()
+    main._adts_cache.clear()
+    urls = iter(["https://gv.example/dead?expire=99999999999",
+                 "https://gv.example/good?expire=99999999999"])
+    monkeypatch.setattr(main, "_resolve_stream_sync", lambda video_id: next(urls))
+
+    class RefusesDead(FakeAsyncClient):
+        async def get(self, url, headers=None, timeout=None):
+            if "dead" in url:
+                return httpx.Response(403)
+            return await super().get(url, headers, timeout)
+
+    monkeypatch.setattr(main, "get_upstream_client", lambda: RefusesDead())
+    _no_remux(monkeypatch)
+
+    resp = TestClient(main.app).get("/stream/abc123")
+
+    assert resp.status_code == 200
+    assert main._stream_cache["abc123"]["url"].endswith("good?expire=99999999999")
+    main._stream_cache.clear()
+    main._adts_cache.clear()
+
+
 @pytest.mark.live
 def test_live_search_returns_tracks_with_artist():
     resp = TestClient(main.app).get("/search", params={"q": "Daft Punk One More Time"})

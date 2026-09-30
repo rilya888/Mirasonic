@@ -5,12 +5,14 @@ https://listenbrainz.readthedocs.io/en/latest/users/api/core.html
 https://listenbrainz.readthedocs.io/en/latest/users/api/recommendation.html
 https://listenbrainz.readthedocs.io/en/latest/users/api/metadata.html
 https://listenbrainz.readthedocs.io/en/latest/users/api/misc.html
-https://listenbrainz.readthedocs.io/en/latest/users/api/player.html
+https://musicbrainz.org/doc/MusicBrainz_API
 """
 
-from urllib.parse import urlparse
-
 import httpx
+
+MUSICBRAINZ_BASE_URL = "https://musicbrainz.org"
+# MusicBrainz rejects anonymous clients; it asks for an app name and a contact.
+MUSICBRAINZ_USER_AGENT = "Mirasonic/0.2 ( https://github.com/rilya888/Mirasonic )"
 
 
 class ListenBrainzClient:
@@ -101,45 +103,29 @@ class ListenBrainzClient:
         return body.get("payload", {}).get("releases", body.get("releases", []))
 
     async def get_release_tracks(self, release_mbid: str) -> list[dict]:
-        """Fetch and normalize JSPF tracks for a MusicBrainz release."""
-        response = await self.client.post(f"/player/release/{release_mbid}/")
+        """Fetch a release's tracks from MusicBrainz.
+
+        ListenBrainz's /player/release/ JSPF endpoint answers 410 Gone since
+        2026-09; the MusicBrainz web service is the source it wrapped.
+        """
+        response = await self.client.get(
+            f"{MUSICBRAINZ_BASE_URL}/ws/2/release/{release_mbid}",
+            params={"inc": "recordings artist-credits", "fmt": "json"},
+            headers={"User-Agent": MUSICBRAINZ_USER_AGENT},
+        )
         response.raise_for_status()
-        tracks = response.json().get("playlist", {}).get("track", [])
+        release = response.json()
         return [
             {
                 "title": track.get("title"),
-                "artist": track.get("creator"),
-                "album": track.get("album"),
-                "duration_seconds": self._duration_seconds(track.get("duration")),
-                "recording_mbid": self._recording_mbid(track),
+                "artist": "".join(
+                    credit.get("name", "") + credit.get("joinphrase", "")
+                    for credit in track.get("artist-credit", [])
+                ) or None,
+                "album": release.get("title"),
+                "duration_seconds": track["length"] / 1000 if track.get("length") else None,
+                "recording_mbid": (track.get("recording") or {}).get("id"),
             }
-            for track in tracks
+            for medium in release.get("media", [])
+            for track in medium.get("tracks", [])
         ]
-
-    @staticmethod
-    def _recording_mbid(track: dict) -> str | None:
-        """Extract a recording MBID from a JSPF MusicBrainz identifier."""
-        if track.get("recording_mbid"):
-            return track["recording_mbid"]
-        identifiers = track.get("identifier", [])
-        if isinstance(identifiers, str):
-            identifiers = [identifiers]
-        if not isinstance(identifiers, list):
-            return None
-        for identifier in identifiers:
-            if not isinstance(identifier, str):
-                continue
-            parsed = urlparse(identifier)
-            path_parts = parsed.path.strip("/").split("/")
-            if parsed.netloc in {"musicbrainz.org", "www.musicbrainz.org"} and path_parts[:1] == [
-                "recording"
-            ]:
-                return path_parts[1] if len(path_parts) > 1 else None
-        return None
-
-    @staticmethod
-    def _duration_seconds(duration: int | float | None) -> int | float | None:
-        """Convert JSPF millisecond durations into seconds."""
-        if duration is None:
-            return None
-        return duration / 1000

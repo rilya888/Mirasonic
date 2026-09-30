@@ -224,7 +224,18 @@ async def run_weekly(
             release_mbid = _release_mbid(release)
             if not release_mbid:
                 continue
-            for item in (await lb.get_release_tracks(release_mbid))[:2]:
+            try:
+                release_tracks = await lb.get_release_tracks(release_mbid)
+            except httpx.HTTPError as exc:
+                # Fresh releases are a garnish on top of CF; one bad release
+                # must not fail the whole week.
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                logger.warning("release tracks skipped release=%s error_type=%s status=%s",
+                               release_mbid, type(exc).__name__, status)
+                continue
+            finally:
+                await asyncio.sleep(1)  # MusicBrainz allows 1 request/second
+            for item in release_tracks[:2]:
                 if item.get("title") and item.get("artist"):
                     candidates.append({
                         "title": item["title"], "artist": item["artist"],
