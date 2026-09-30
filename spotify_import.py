@@ -43,7 +43,9 @@ ACCEPT_SCORE = 8.0
 # batch; a second per track looks like a person, a hundred in a row like a bot.
 PAUSE_SECONDS = 0.3
 
-REQUIRED_COLUMNS = ("Track URI", "Track Name", "Artist Name(s)", "Duration (ms)")
+REQUIRED_COLUMNS = ("Track URI", "Track Name", "Artist Name(s)")
+# Exportify renamed the column in 2026; older dumps still carry the first name.
+DURATION_COLUMNS = ("Duration (ms)", "Track Duration (ms)")
 
 _FEAT = re.compile(r"\s*[\(\[]?\s*(feat\.?|ft\.?|with)\s+[^\)\]]*[\)\]]?", re.I)
 _NOISE = re.compile(
@@ -64,8 +66,24 @@ def _norm(text: str) -> str:
     return " ".join(text.split())
 
 
+# Spotify spells Russian artists in Latin (`Monetochka`, `Korol i Shut`) while
+# YouTube Music keeps Cyrillic. Same person, different alphabet: compare both
+# sides transliterated. `й` and `ё` need no entry — NFKD in _norm already
+# folded them into `и` and `е`.
+_TRANSLIT = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ж": "zh", "з": "z",
+    "и": "i", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+    "с": "s", "т": "t", "у": "u", "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh",
+    "щ": "shch", "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+})
+
+
+def _latin(text: str) -> str:
+    return _norm(text).translate(_TRANSLIT)
+
+
 def _overlap(a: str, b: str) -> float:
-    ta, tb = set(_norm(a).split()), set(_norm(b).split())
+    ta, tb = set(_latin(a).split()), set(_latin(b).split())
     if not ta or not tb:
         return 0.0
     return len(ta & tb) / min(len(ta), len(tb))
@@ -90,12 +108,12 @@ def score(title: str, artists: list[str], seconds: int, candidate: dict) -> floa
     else:
         total = -2.0
 
-    if _norm(title) == _norm(candidate["title"]):
+    if _latin(title) == _latin(candidate["title"]):
         total += 3.0
     else:
         total += 2.0 * _overlap(title, candidate["title"])
 
-    if any(_norm(a) == _norm(candidate["artist"]) for a in artists):
+    if any(_latin(a) == _latin(candidate["artist"]) for a in artists):
         total += 3.0
     else:
         total += 2.0 * max((_overlap(a, candidate["artist"]) for a in artists), default=0.0)
@@ -107,7 +125,11 @@ def read_csv(path: str) -> list[dict]:
     """Exportify rows in playlist order. Spotify local files are skipped."""
     with open(path, encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
-        missing = [c for c in REQUIRED_COLUMNS if c not in (reader.fieldnames or [])]
+        fields = reader.fieldnames or []
+        missing = [c for c in REQUIRED_COLUMNS if c not in fields]
+        duration = next((c for c in DURATION_COLUMNS if c in fields), None)
+        if duration is None:
+            missing.append(DURATION_COLUMNS[0])
         if missing:
             raise ValueError(f"{path}: missing columns {missing} — not an Exportify export")
         rows = []
@@ -118,9 +140,11 @@ def read_csv(path: str) -> list[dict]:
             rows.append({
                 "uri": uri,
                 "title": (row.get("Track Name") or "").strip(),
-                "artists": [a.strip() for a in (row.get("Artist Name(s)") or "").split(",") if a.strip()],
+                # exportify.net joins artists with `;`, older dumps with `,`.
+                "artists": [a.strip() for a in re.split(r"[,;]", row.get("Artist Name(s)") or "")
+                            if a.strip()],
                 "album": (row.get("Album Name") or "").strip() or None,
-                "seconds": round(int(row["Duration (ms)"]) / 1000),
+                "seconds": round(int(row[duration]) / 1000),
             })
     return rows
 
@@ -192,15 +216,20 @@ def _playlist_id_by_name(lib: library.Library, name: str) -> Optional[int]:
 
 
 async def import_file(lib: library.Library, path: str, name: Optional[str] = None,
-                      dry_run: bool = False) -> dict:
+                      dry_run: bool = False, replace: bool = False) -> dict:
+    """`replace` mirrors the file instead of appending: for Spotify's own mixes
+    (Artist Mix, Daily Mix), whose contents are swapped rather than grown. The
+    playlist becomes exactly the matched tracks in file order; hand-made
+    additions do not survive it."""
     playlist_name = name or os.path.splitext(os.path.basename(path))[0]
     tracks = read_csv(path)
     mapping = lib.get_spotify_map()
 
     playlist_id = _playlist_id_by_name(lib, playlist_name)
-    existing = set()
+    current = []
     if playlist_id is not None:
-        existing = {s["id"] for s in (lib.get_playlist(playlist_id) or {}).get("songs", [])}
+        current = [s["id"] for s in (lib.get_playlist(playlist_id) or {}).get("songs", [])]
+    existing = set() if replace else set(current)
 
     to_add: list[tuple] = []
     new_pairs: list[tuple[str, str]] = []
@@ -242,13 +271,20 @@ async def import_file(lib: library.Library, path: str, name: Optional[str] = Non
         ))
 
     report["added"] = len(to_add)
+    report["removed"] = len(current) if replace else 0
+    if replace and not to_add and tracks:
+        # Nothing matched at all — an upstream outage, not an empty mix.
+        # Wiping the playlist over it would be a silent loss.
+        report["added"] = report["removed"] = 0
+        return report
     if dry_run:
         return report
 
     if playlist_id is None:
         playlist_id = lib.create_playlist(playlist_name)
-    if to_add:
-        lib.update_playlist(playlist_id, playlist_name, [], to_add)
+    if to_add or report["removed"]:
+        lib.update_playlist(playlist_id, playlist_name,
+                            list(range(report["removed"])), to_add)
     if new_pairs:
         # Only after update_playlist: spotify_map references songs.
         lib.put_spotify_map([(uri, sid) for uri, sid in new_pairs
@@ -263,6 +299,8 @@ def print_report(report: dict) -> None:
     print(f"  taken from mappings: {report['from_map']}")
     print(f"  already in playlist: {report['already_in_playlist']}")
     print(f"  added:               {report['added']}")
+    if report["removed"]:
+        print(f"  replaced (old):      {report['removed']}")
     if report["unmatched"]:
         print(f"  not found ({len(report['unmatched'])}):")
         for item in report["unmatched"]:
@@ -275,6 +313,8 @@ async def _main(argv: list[str]) -> int:
     parser.add_argument("files", nargs="*", help="exported CSV files")
     parser.add_argument("--name", help="playlist name (defaults to the file name)")
     parser.add_argument("--dry-run", action="store_true", help="report only, write nothing")
+    parser.add_argument("--replace", action="store_true",
+                        help="make the playlist exactly the file (for Spotify mixes)")
     parser.add_argument("--map", action="append", metavar="URI=VIDEOID", default=[],
                         help="map a track by hand; later imports pick it up on their own")
     args = parser.parse_args(argv)
@@ -294,7 +334,7 @@ async def _main(argv: list[str]) -> int:
         print("Mapped by hand:")
         await add_mapping(lib, pairs)
     for path in args.files:
-        print_report(await import_file(lib, path, args.name, args.dry_run))
+        print_report(await import_file(lib, path, args.name, args.dry_run, args.replace))
     if args.dry_run:
         print("\n--dry-run: nothing was written to the database")
     return 0

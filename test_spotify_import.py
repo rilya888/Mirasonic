@@ -289,3 +289,71 @@ def test_manual_mapping_lets_the_next_import_pick_the_track_up(lib, tmp_path, mo
     # The first four hand-mapped tracks ended up without artwork precisely
     # because add_mapping did not request it.
     assert song["artwork_url"] == "https://example.invalid/uma.jpg"
+
+
+def test_replace_swaps_the_mix_for_the_new_file(lib, tmp_path, monkeypatch):
+    """A Spotify mix changes its tracks rather than growing: the playlist mirrors it."""
+    search, asked = fake_search({
+        "Artist First": [candidate("vA", "First", "Artist", 200)],
+        "Artist Second": [candidate("vB", "Second", "Artist", 300)],
+        "Artist Third": [candidate("vC", "Third", "Artist", 250)],
+    })
+    monkeypatch.setattr(spotify_import.main, "search", search)
+    asyncio.run(spotify_import.import_file(lib, write_csv(tmp_path, "Mix.csv", [
+        row("spotify:track:a", "First", "Alb", "Artist", 200000),
+        row("spotify:track:b", "Second", "Alb", "Artist", 300000),
+    ]), replace=True))
+
+    report = asyncio.run(spotify_import.import_file(lib, write_csv(tmp_path, "Mix.csv", [
+        row("spotify:track:c", "Third", "Alb", "Artist", 250000),
+        row("spotify:track:a", "First", "Alb", "Artist", 200000),
+    ]), replace=True))
+
+    assert [s["id"] for s in lib.get_playlist(report["playlist_id"])["songs"]] == ["vC", "vA"]
+    assert (report["removed"], report["added"], report["from_map"]) == (2, 2, 1)
+    assert asked.count("Artist First") == 1  # a known track is not searched again
+
+
+def test_replace_does_not_wipe_the_playlist_when_nothing_matched(lib, tmp_path, monkeypatch):
+    path = write_csv(tmp_path, "Mix.csv", [
+        row("spotify:track:a", "First", "Alb", "Artist", 200000)])
+    search, _ = fake_search({"Artist First": [candidate("vA", "First", "Artist", 200)]})
+    monkeypatch.setattr(spotify_import.main, "search", search)
+    playlist_id = asyncio.run(spotify_import.import_file(lib, path, replace=True))["playlist_id"]
+
+    async def failing(q="", limit=20, continuation=""):
+        return spotify_import.main.JSONResponse({"error": "upstream"}, status_code=502)
+
+    monkeypatch.setattr(spotify_import.main, "search", failing)
+    asyncio.run(spotify_import.import_file(lib, write_csv(tmp_path, "Mix.csv", [
+        row("spotify:track:z", "New", "Alb", "Artist", 100000)]), replace=True))
+
+    assert [s["id"] for s in lib.get_playlist(playlist_id)["songs"]] == ["vA"]
+
+
+def test_read_csv_accepts_the_2026_exportify_duration_column(tmp_path):
+    path = tmp_path / "Mix.csv"
+    path.write_text("Track URI,Track Name,Artist Name(s),Track Duration (ms)\n"
+                    'spotify:track:a,"First","Artist",200000\n', encoding="utf-8")
+    assert spotify_import.read_csv(str(path))[0]["seconds"] == 200
+
+
+def test_score_accepts_an_artist_spelled_in_latin():
+    """Spotify gives `Monetochka`, YouTube Music `Монеточка` — the same person."""
+    value = spotify_import.score("Каждый раз", ["Monetochka"], 200,
+                                 candidate("v", "Каждый раз", "монеточка", 200))
+    assert value >= spotify_import.ACCEPT_SCORE
+
+
+def test_transliteration_does_not_make_another_artist_match():
+    value = spotify_import.score("Maria", ["HWASA"], 189,
+                                 candidate("v", "Maria", "Мария Пианелла", 189))
+    assert value < spotify_import.ACCEPT_SCORE
+
+
+def test_read_csv_splits_artists_on_semicolons(tmp_path):
+    path = tmp_path / "Mix.csv"
+    path.write_text("Track URI,Track Name,Artist Name(s),Duration (ms)\n"
+                    'spotify:track:a,"Люди с автоматами","Swanky Tunes;Monetochka;Noize MC",192490\n',
+                    encoding="utf-8")
+    assert spotify_import.read_csv(str(path))[0]["artists"] == ["Swanky Tunes", "Monetochka", "Noize MC"]

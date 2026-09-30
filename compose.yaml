@@ -4,6 +4,7 @@ services:
   worker:
     build:
       context: .
+      target: app
     image: mirasonic:0.2.0
     environment:
       # Mandatory: without them the server refuses to start. Set them in a
@@ -47,6 +48,7 @@ services:
     profiles: [agent]
     build:
       context: .
+      target: app
     command: ["python", "music_agent.py", "daemon"]
     environment:
       MIRASONIC_DB: /data/mirasonic.db
@@ -64,5 +66,32 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    volumes:
+      - ${LIBRARY_PATH:-./data}:/data
+
+  # Weekly mirror of Spotify's own mixes through Exportify (docs/SPOTIFY-IMPORT.md).
+  # Needs data/spotify-session.json, created once with `spotify_sync.py login`.
+  spotify-sync:
+    image: mirasonic-spotify-sync:0.2.0
+    profiles: [spotify-sync]
+    build:
+      context: .
+      target: spotify-sync
+    environment:
+      MIRASONIC_DB: /data/mirasonic.db
+      REGION: ${REGION:?set REGION in .env, e.g. US}
+      SPOTIFY_SESSION: /data/spotify-session.json
+      SPOTIFY_SYNC_PLAYLISTS: ${SPOTIFY_SYNC_PLAYLISTS:-}
+      SPOTIFY_SYNC_WEEKDAY: ${SPOTIFY_SYNC_WEEKDAY:-0}
+      SPOTIFY_SYNC_HOUR_UTC: ${SPOTIFY_SYNC_HOUR_UTC:-7}
+      HOME: /tmp
+      PYTHONUNBUFFERED: "1"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    shm_size: 256m
     volumes:
       - ${LIBRARY_PATH:-./data}:/data

@@ -11,7 +11,7 @@ history, and deleting tracks that vanished from a Spotify playlist.
 
 A CSV from [Exportify](https://exportify.net), a web page that exports Spotify
 playlists to a table. Four columns are needed: `Track URI`, `Track Name`,
-`Artist Name(s)`, `Duration (ms)`.
+`Artist Name(s)`, `Duration (ms)` (`Track Duration (ms)` in 2026 exports).
 
 There is deliberately no Spotify API integration. OAuth means an account,
 tokens and somewhere to keep them, for an operation done once a month that
@@ -60,9 +60,13 @@ docker compose exec -T worker python spotify_import.py \
     --map spotify:track:XXXX=videoId
 ```
 
-Needed where the automation cannot be trusted but a human can: an artist name
-written in a different alphabet. `Уматурман` against `Uma2rman`,
-`Nautilus Pompilius` against `Наутилус Помпилиус` — title and duration match
+Artist and title are compared transliterated, so a plain romanisation matches
+on its own: `Nautilus Pompilius` against `Наутилус Помпилиус`, `Monetochka`
+against `Монеточка` (a live Monetochka Mix went from 12 to 44 of 50 with it).
+
+Needed where the automation cannot be trusted but a human can: a name that is
+not a plain romanisation. `Уматурман` against `Uma2rman`, `Splean` against
+`Сплин`, `Agatha Christie` against `Агата Кристи` — title and duration match
 exactly, and the score is 6.0.
 
 The threshold is not lowered for this, because a *different* song sharing a
@@ -105,6 +109,50 @@ A second run over three more playlists (150 tracks): 146 matched on their own,
 3 were artist names in a different alphabet and were set with `--map`, and 1 is
 absent from the catalogue — **149 of 150**. The library after both runs: 6
 playlists, 320 positions, 303 tracks, 299 rows in `spotify_map`, 0 orphans.
+
+## Spotify mixes: `--replace`
+
+Artist Mix and Daily Mix playlists are rebuilt by Spotify, not grown, so
+appending would make them swell forever. `--replace` makes the playlist exactly
+the matched tracks of the file, in file order. Known tracks still come from
+`spotify_map` without a search. Hand-made additions do not survive a replace.
+If no track matched at all, the playlist is left alone: that is an upstream
+outage, not an empty mix.
+
+```sh
+docker compose exec -T worker python spotify_import.py --replace "/data/Монеточка Mix.csv"
+```
+
+## Automatic weekly mirror
+
+`spotify_sync.py` does the Exportify step itself, in headless Chromium, and
+imports each listed mix with `--replace`. Spotify's API answers 404 on
+Spotify-owned playlists for apps registered after November 2024; Exportify's
+app is older and still reads them, which is why the browser goes through it
+rather than through an API client of our own.
+
+Once, on a machine with a screen (Spotify may ask for a captcha or a code):
+
+```sh
+pip install playwright==1.63.0 && playwright install chromium
+python spotify_sync.py login --session ./data/spotify-session.json
+```
+
+Copy `spotify-session.json` into the server's `LIBRARY_PATH`. It holds live
+Spotify cookies: treat it like a password. Then in `.env`:
+
+```sh
+SPOTIFY_SYNC_PLAYLISTS=Монеточка Mix|Daily Mix 1
+```
+
+```sh
+docker compose --profile spotify-sync up -d --build
+docker compose run --rm spotify-sync python spotify_sync.py run   # once, now
+```
+
+The daemon checks hourly and runs once per week (Monday 07:00 UTC by default)
+and retries until it succeeds. When the session dies, the log says
+`spotify session expired`; repeat `login` and copy the file again.
 
 ## Tests
 
