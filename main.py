@@ -483,10 +483,14 @@ async def get_song_duration(video_id: str) -> int:
     return (await get_song_details(video_id))["duration"]
 
 
+def _is_unavailable(exc: DownloadError) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in UNAVAILABLE_MARKERS)
+
+
 def _resolve_error_response(exc: DownloadError, video_id: str, endpoint: str) -> JSONResponse:
     """404 — unavailable anonymously and retrying will not help; 502 — everything else."""
-    message = str(exc).lower()
-    if any(marker in message for marker in UNAVAILABLE_MARKERS):
+    if _is_unavailable(exc):
         logger.info("%s video_id=%s status=404 (unavailable)", endpoint, video_id)
         return JSONResponse({"error": "not_found"}, status_code=404)
     logger.info("%s video_id=%s status=502 (resolve failed)", endpoint, video_id)
@@ -605,6 +609,32 @@ async def _remux_to_adts(data: bytes) -> bytes:
     return out
 
 
+_silence: Optional[bytes] = None
+
+
+async def get_silence() -> bytes:
+    """One second of silent ADTS, made once.
+
+    Served in place of a track that will never resolve (age gate, removed).
+    Measured 2026-10-01: on a 404 Amperfy restarts the current track, so one
+    age-gated song looped every ~13 s for good and nothing else played. A
+    short silent track ends normally and the player moves to the next one.
+    """
+    global _silence
+    if _silence is None:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "1",
+            "-c:a", "aac", "-f", "adts", "pipe:1",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+        if proc.returncode != 0 or not out:
+            raise UpstreamError(f"ffmpeg silence rc={proc.returncode}: {err[:200]!r}")
+        _silence = out
+    return _silence
+
+
 async def get_adts(video_id: str) -> bytes:
     async with _adts_lock:
         cached = _adts_cache.get(video_id)
@@ -612,6 +642,12 @@ async def get_adts(video_id: str) -> bytes:
             return cached
         try:
             data = await _download(await get_stream_url(video_id))
+        except DownloadError as exc:
+            if not _is_unavailable(exc):
+                raise
+            logger.info("stream video_id=%s unavailable, serving silence to skip", video_id)
+            data = None
+            audio = await get_silence()
         except UpstreamRefused:
             # A URL googlevideo refused stays refused until it expires (~6 h).
             # Measured 2026-09-29: without eviction every retry hit the same
@@ -619,7 +655,8 @@ async def get_adts(video_id: str) -> bytes:
             # current track each time. One fresh resolve usually plays.
             _stream_cache.pop(video_id, None)
             data = await _download(await get_stream_url(video_id))
-        audio = await _remux_to_adts(data)
+        if data is not None:
+            audio = await _remux_to_adts(data)
         _adts_cache[video_id] = audio
         while len(_adts_cache) > ADTS_CACHE_SIZE:
             _adts_cache.pop(next(iter(_adts_cache)))  # dict keeps insertion order

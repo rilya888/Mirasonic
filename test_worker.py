@@ -423,14 +423,23 @@ def test_stream_slices_locally_and_always_pulls_the_whole_file(monkeypatch):
     assert FakeAsyncClient.captured_headers == {"Range": "bytes=0-"}
 
 
-def test_stream_maps_unavailable_download_error_to_404(monkeypatch):
+def test_stream_serves_silence_for_unavailable_track(monkeypatch):
+    """A 404 makes Amperfy restart the same track forever; silence lets it move on."""
+    calls = []
+
     async def fake_get_stream_url(video_id):
+        calls.append(video_id)
         raise DownloadError("ERROR: [youtube] abc123: Video unavailable")
 
     monkeypatch.setattr(main, "get_stream_url", fake_get_stream_url)
+    main._adts_cache.clear()
     resp = TestClient(main.app).get("/stream/abc123")
-    assert resp.status_code == 404
-    assert resp.json() == {"error": "not_found"}
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "audio/aac"
+    assert resp.content[:2] == b"\xff\xf1"  # ADTS sync word
+    TestClient(main.app).get("/stream/abc123", headers={"Range": "bytes=0-1"})
+    assert calls == ["abc123"]  # second request served from cache, no re-resolve
+    main._adts_cache.clear()
 
 
 def test_stream_maps_other_download_error_to_502(monkeypatch):
@@ -460,7 +469,7 @@ def test_stream_maps_upstream_connect_failure_to_502(monkeypatch):
 # live tests — real network, real YouTube Music. Run with `pytest -m live`.
 # ---------------------------------------------------------------------------
 
-def test_stream_maps_age_gate_to_404(monkeypatch):
+def test_stream_serves_silence_for_age_gate(monkeypatch):
     async def fake_get_stream_url(video_id):
         raise DownloadError(
             "ERROR: [youtube] abc123: Sign in to confirm your age. "
@@ -468,9 +477,11 @@ def test_stream_maps_age_gate_to_404(monkeypatch):
         )
 
     monkeypatch.setattr(main, "get_stream_url", fake_get_stream_url)
+    main._adts_cache.clear()
     resp = TestClient(main.app).get("/stream/abc123")
-    assert resp.status_code == 404
-    assert resp.json() == {"error": "not_found"}
+    assert resp.status_code == 200
+    assert resp.content[:2] == b"\xff\xf1"
+    main._adts_cache.clear()
 
 
 def test_stream_maps_bot_check_to_502_not_404(monkeypatch):
