@@ -139,10 +139,15 @@ python spotify_sync.py login --session ./data/spotify-session.json
 ```
 
 Copy `spotify-session.json` into the server's `LIBRARY_PATH`. It holds live
-Spotify cookies: treat it like a password. Then in `.env`:
+Spotify cookies: treat it like a password.
+
+By default every playlist in the Spotify library is mirrored, so one added
+there appears on the server with the next run. Liked Songs, Saved Albums and
+empty playlists are skipped. A playlist removed from Spotify is *not* deleted
+here. To mirror only some, list them in `.env`:
 
 ```sh
-SPOTIFY_SYNC_PLAYLISTS=Монеточка Mix|Daily Mix 1
+SPOTIFY_SYNC_PLAYLISTS=Monetochka Mix|Daily Mix 1
 ```
 
 ```sh

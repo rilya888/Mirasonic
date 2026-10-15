@@ -80,8 +80,17 @@ async def login(session_path: str) -> None:
     print(f"Session saved to {session_path}")
 
 
+# Exportify lists these too, but they are not playlists: likes are `starred` on
+# the server, and saved albums are albums.
+NOT_PLAYLISTS = {"Liked Songs", "Saved Albums"}
+
+
 async def export_playlists(names: list[str], session_path: str, out_dir: str) -> dict[str, str]:
-    """Download an Exportify CSV per playlist name; a missing name is skipped."""
+    """Download an Exportify CSV per playlist name; a missing name is skipped.
+
+    No names means every playlist in the Spotify library, so one added there
+    turns up on the server with the next run.
+    """
     from playwright.async_api import TimeoutError as PlaywrightTimeout, async_playwright
 
     files: dict[str, str] = {}
@@ -101,6 +110,13 @@ async def export_playlists(names: list[str], session_path: str, out_dir: str) ->
                 await page.locator(TABLE_READY).wait_for(timeout=60_000)
             except PlaywrightTimeout:
                 raise SessionExpired(page.url.split("?")[0]) from None
+
+            if not names:
+                rows = await page.locator("tbody tr").evaluate_all(
+                    "rs => rs.map(r => [r.cells[1].innerText, r.cells[3].innerText])")
+                names = [name for name, total in rows
+                         if name not in NOT_PLAYLISTS and total.strip() != "0"]
+                logger.info("library playlists=%d", len(names))
 
             for index, name in enumerate(names):
                 # `has` resolves inside each row, so the link locator must not be rooted anywhere.
@@ -183,8 +199,6 @@ def cli(argv: list[str] | None = None) -> int:
         asyncio.run(login(config.session_path))
         return 0
 
-    if not config.playlists:
-        parser.error("set SPOTIFY_SYNC_PLAYLISTS, e.g. 'Монеточка Mix|Daily Mix 1'")
     if not os.path.exists(config.session_path):
         parser.error(f"{config.session_path} not found — run `spotify_sync.py login` first")
 
