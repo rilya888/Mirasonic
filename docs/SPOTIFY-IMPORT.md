@@ -123,7 +123,7 @@ outage, not an empty mix.
 docker compose exec -T worker python spotify_import.py --replace "/data/Монеточка Mix.csv"
 ```
 
-## Automatic weekly mirror
+## Automatic daily mirror
 
 `spotify_sync.py` does the Exportify step itself, in headless Chromium, and
 imports each listed mix with `--replace`. Spotify's API answers 404 on
@@ -155,7 +155,7 @@ docker compose --profile spotify-sync up -d --build
 docker compose run --rm spotify-sync python spotify_sync.py run   # once, now
 ```
 
-The daemon checks hourly and runs once per week (Monday 07:00 UTC by default)
+The daemon checks hourly and runs once a day (07:00 UTC by default, `SPOTIFY_SYNC_HOUR_UTC`)
 and retries until it succeeds. When the session dies, the log says
 `spotify session expired`; repeat `login` and copy the file again.
 

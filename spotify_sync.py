@@ -1,4 +1,4 @@
-"""Weekly mirror of Spotify's own mixes (Artist Mix, Daily Mix) into the library.
+"""Daily mirror of Spotify's own mixes (Artist Mix, Daily Mix) into the library.
 
 Spotify's Web API answers 404 on playlists Spotify owns for any app registered
 after November 2024. Exportify's app predates that and still reads them, so a
@@ -21,7 +21,7 @@ import os
 import sys
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 logger = logging.getLogger("spotify_sync")
@@ -42,7 +42,6 @@ class SyncConfig:
     playlists: list[str]
     session_path: str
     state_path: str
-    weekday: int
     hour_utc: int
 
 
@@ -57,8 +56,7 @@ def sync_config(environ=None) -> SyncConfig:
     return SyncConfig(
         playlist_names(env.get("SPOTIFY_SYNC_PLAYLISTS", "")),
         session,
-        os.path.join(os.path.dirname(session), "spotify-sync.week"),
-        int(env.get("SPOTIFY_SYNC_WEEKDAY", "0")),
+        os.path.join(os.path.dirname(session), "spotify-sync.last"),
         int(env.get("SPOTIFY_SYNC_HOUR_UTC", "7")),
     )
 
@@ -154,7 +152,7 @@ async def sync_once(lib, config: SyncConfig,
     return reports
 
 
-def _last_week(state_path: str) -> str:
+def _last_run(state_path: str) -> str:
     try:
         with open(state_path) as handle:
             return handle.read().strip()
@@ -165,22 +163,21 @@ def _last_week(state_path: str) -> str:
 async def daemon(config: SyncConfig, run: Callable[[], Awaitable[object]], *,
                  now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  sleep: Callable[[float], Awaitable[object]] = asyncio.sleep) -> None:
-    """Check hourly; retry the latest scheduled week until one run succeeds."""
-    from music_agent import scheduled_week
-
+    """Check hourly; retry today's run until one succeeds."""
     while True:
-        week_start, _ = scheduled_week(now_fn(), config.weekday, config.hour_utc)
-        if _last_week(config.state_path) != week_start:
+        # A "day" starts at hour_utc, so before that hour yesterday's run still counts.
+        day = (now_fn() - timedelta(hours=config.hour_utc)).date().isoformat()
+        if _last_run(config.state_path) != day:
             try:
                 await run()
                 with open(config.state_path, "w") as handle:
-                    handle.write(week_start)
-                logger.info("spotify sync done week_start=%s", week_start)
+                    handle.write(day)
+                logger.info("spotify sync done day=%s", day)
             except SessionExpired as exc:
                 logger.error("spotify session expired at %s — run `spotify_sync.py login` again", exc)
             except Exception as exc:
-                logger.error("spotify sync failed week_start=%s error_type=%s",
-                             week_start, type(exc).__name__)
+                logger.error("spotify sync failed day=%s error_type=%s",
+                             day, type(exc).__name__)
         await sleep(3600)
 
 
@@ -194,7 +191,7 @@ def cli(argv: list[str] | None = None) -> int:
     config = sync_config()
     if args.session:
         config = SyncConfig(config.playlists, args.session, config.state_path,
-                            config.weekday, config.hour_utc)
+                            config.hour_utc)
     if args.command == "login":
         asyncio.run(login(config.session_path))
         return 0

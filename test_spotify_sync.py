@@ -1,4 +1,4 @@
-"""Tests for the weekly Spotify mix mirror. The browser part is stubbed."""
+"""Tests for the daily Spotify mix mirror. The browser part is stubbed."""
 import asyncio
 from datetime import datetime, timezone
 
@@ -11,7 +11,7 @@ HEADER = "Track URI,Track Name,Artist Name(s),Track Duration (ms)\n"
 
 def config(tmp_path, playlists=("Монеточка Mix",)):
     return spotify_sync.SyncConfig(list(playlists), str(tmp_path / "session.json"),
-                                   str(tmp_path / "spotify-sync.week"), 0, 7)
+                                   str(tmp_path / "spotify-sync.last"), 7)
 
 
 def test_playlist_names_split_on_pipe_not_comma():
@@ -60,7 +60,7 @@ def run_daemon(cfg, run, now, ticks):
         pass
 
 
-def test_daemon_runs_once_per_week_and_retries_after_a_failure(tmp_path):
+def test_daemon_runs_once_per_day_and_retries_after_a_failure(tmp_path):
     cfg = config(tmp_path)
     now = datetime(2026, 9, 28, 8, tzinfo=timezone.utc)  # Monday, after 07:00
     attempts = []
@@ -74,3 +74,17 @@ def test_daemon_runs_once_per_week_and_retries_after_a_failure(tmp_path):
 
     assert len(attempts) == 2  # failed, retried an hour later, then left alone
     assert open(cfg.state_path).read() == "2026-09-28"
+
+
+def test_daemon_runs_again_the_next_day_but_not_before_the_hour(tmp_path):
+    cfg = config(tmp_path)
+    attempts = []
+
+    async def run():
+        attempts.append(1)
+
+    run_daemon(cfg, run, datetime(2026, 10, 15, 8, tzinfo=timezone.utc), ticks=2)
+    run_daemon(cfg, run, datetime(2026, 10, 16, 6, tzinfo=timezone.utc), ticks=1)  # before 07:00
+    assert len(attempts) == 1
+    run_daemon(cfg, run, datetime(2026, 10, 16, 7, tzinfo=timezone.utc), ticks=1)
+    assert len(attempts) == 2

@@ -69,7 +69,7 @@ services:
     volumes:
       - ${LIBRARY_PATH:-./data}:/data
 
-  # Weekly mirror of Spotify's own mixes through Exportify (docs/SPOTIFY-IMPORT.md).
+  # Daily mirror of Spotify playlists through Exportify (docs/SPOTIFY-IMPORT.md).
   # Needs data/spotify-session.json, created once with `spotify_sync.py login`.
   spotify-sync:
     image: mirasonic-spotify-sync:0.2.0
@@ -82,7 +82,6 @@ services:
       REGION: ${REGION:?set REGION in .env, e.g. US}
       SPOTIFY_SESSION: /data/spotify-session.json
       SPOTIFY_SYNC_PLAYLISTS: ${SPOTIFY_SYNC_PLAYLISTS:-}
-      SPOTIFY_SYNC_WEEKDAY: ${SPOTIFY_SYNC_WEEKDAY:-0}
       SPOTIFY_SYNC_HOUR_UTC: ${SPOTIFY_SYNC_HOUR_UTC:-7}
       HOME: /tmp
       PYTHONUNBUFFERED: "1"
