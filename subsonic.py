@@ -1062,6 +1062,9 @@ _HANDLERS["getArtist"] = _get_artist
 # browses by ID3 (getArtists/getAlbumList2). An error here is safe, there is
 # no retry loop.
 _HANDLERS["getMusicDirectory"] = _not_found
+# getLyrics — Music Assistant asks before every track and aborts the whole
+# play_media on "Unsupported action"; "not found" is what it expects to handle.
+_HANDLERS["getLyrics"] = _not_found
 
 # phase 2 — the SQLite library (library.py)
 _HANDLERS["getPlaylists"] = _get_playlists

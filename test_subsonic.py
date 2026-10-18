@@ -603,6 +603,11 @@ def test_update_playlist_adds_songs_in_order(lib):
     assert songs[0]["duration"] == 111
 
 
+def test_get_lyrics_is_not_found_rather_than_unsupported():
+    resp = client.get("/rest/getLyrics.view", params={**token_params(), "artist": "A", "title": "T"})
+    assert 'code="70"' in resp.text
+
+
 def test_json_ping_matches_subsonic_json_shape():
     """Music Assistant (py-opensonic) only speaks f=json."""
     resp = client.get("/rest/ping.view", params={**token_params(), "f": "json"})
