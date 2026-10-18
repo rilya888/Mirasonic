@@ -1038,6 +1038,14 @@ _register_stub("getPodcasts", "podcasts")
 _register_stub("getNewestPodcasts", "newestPodcasts")
 _register_stub("getInternetRadioStations", "internetRadioStations")
 _register_stub("getSimilarSongs2", "similarSongs2")
+# Music Assistant opens every artist/album page with an *Info2 call and treats
+# "Unsupported action" as fatal; empty answers are what a server without
+# last.fm returns.
+_register_stub("getSimilarSongs", "similarSongs")
+_register_stub("getArtistInfo2", "artistInfo2")
+_register_stub("getAlbumInfo2", "albumInfo")
+_register_stub("getTopSongs", "topSongs")
+_register_stub("getBookmarks", "bookmarks")
 
 _register_stub("getOpenSubsonicExtensions", "openSubsonicExtensions")
 _HANDLERS["scrobble"] = _scrobble

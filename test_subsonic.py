@@ -304,6 +304,12 @@ def test_search_cache_get_refreshes_lru_order():
     ("getNewestPodcasts", "newestPodcasts"),
     ("getInternetRadioStations", "internetRadioStations"),
     ("getSimilarSongs2", "similarSongs2"),
+    ("getSimilarSongs", "similarSongs"),
+    ("getArtistInfo2", "artistInfo2"),
+    ("getAlbumInfo2", "albumInfo"),
+    ("getTopSongs", "topSongs"),
+    ("getBookmarks", "bookmarks"),
+    ("getOpenSubsonicExtensions", "openSubsonicExtensions"),
     # getRandomSongs/getPlaylists moved to phase 2, getArtists/getAlbumList2 to
     # phase 3 (all backed by SQLite, see the tests using the `lib` fixture
     # below) — they answer empty here only because the test library is empty,
@@ -316,8 +322,7 @@ def test_stub_endpoints_return_empty_success(action, tag):
     assert f"<{tag}" in resp.text
 
 
-@pytest.mark.parametrize("action", ["setRating", "deletePodcastEpisode",
-                                     "getOpenSubsonicExtensions"])
+@pytest.mark.parametrize("action", ["setRating", "deletePodcastEpisode"])
 def test_noop_endpoints_return_empty_success(action):
     resp = client.get(f"/rest/{action}.view", params=token_params())
     assert resp.status_code == 200
