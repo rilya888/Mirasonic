@@ -598,6 +598,48 @@ def test_update_playlist_adds_songs_in_order(lib):
     assert songs[0]["duration"] == 111
 
 
+def test_json_ping_matches_subsonic_json_shape():
+    """Music Assistant (py-opensonic) only speaks f=json."""
+    resp = client.get("/rest/ping.view", params={**token_params(), "f": "json"})
+    assert resp.headers["content-type"].startswith("application/json")
+    body = resp.json()["subsonic-response"]
+    assert body["status"] == "ok"
+    assert body["version"] == "1.16.1"
+    assert "xmlns" not in body
+
+
+def test_json_error_keeps_numeric_code():
+    resp = client.get("/rest/ping.view", params={**token_params(password="wrong"), "f": "json"})
+    body = resp.json()["subsonic-response"]
+    assert body["status"] == "failed"
+    assert body["error"]["code"] == 40
+
+
+def test_json_open_subsonic_extensions_is_iterable_and_empty():
+    resp = client.get("/rest/getOpenSubsonicExtensions.view",
+                      params={**token_params(), "f": "json"})
+    assert list(resp.json()["subsonic-response"]["openSubsonicExtensions"]) == []
+
+
+def test_json_playlist_entries_are_lists_with_typed_values(lib):
+    playlist_id = lib.create_playlist("Morning")
+    lib.update_playlist(playlist_id, "Morning", [], [("vid0", "T0", "A", "Al", 100, None)])
+
+    playlists = client.get("/rest/getPlaylists.view",
+                           params={**token_params(), "f": "json"}).json()["subsonic-response"]
+    [summary] = playlists["playlists"]["playlist"]
+    assert summary["songCount"] == 1
+    assert summary["id"] == str(playlist_id)
+
+    playlist = client.get("/rest/getPlaylist.view", params={
+        **token_params(), "f": "json", "id": str(playlist_id),
+    }).json()["subsonic-response"]["playlist"]
+    [entry] = playlist["entry"]
+    assert entry["id"] == "vid0"
+    assert entry["duration"] == 100
+    assert entry["isDir"] is False
+
+
 def test_update_playlist_full_reorder_matches_amperfy_pattern(lib):
     """Amperfy reorders a playlist by removing indices 0..n-1 and re-adding the
     whole list in the new order (syncUpload(playlistToUpdateOrder:)). The

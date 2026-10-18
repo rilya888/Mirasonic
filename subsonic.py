@@ -11,8 +11,10 @@ No knowledge of SQL lives here either — that's library.py; this module only
 resolves metadata and calls into it.
 """
 import asyncio
+import contextvars
 import hashlib
 import hmac
+import json
 import logging
 import os
 import random
@@ -190,7 +192,61 @@ def _root(status: str) -> ET.Element:
     })
 
 
+# f=json (Music Assistant's py-opensonic asks for nothing else). Set per
+# request in rest_dispatch; every handler still builds the same XML tree and
+# _xml_response converts it at the very end.
+_WANT_JSON: contextvars.ContextVar[bool] = contextvars.ContextVar("want_json", default=False)
+
+# XML attributes are all strings; JSON clients type-check them. Names taken
+# from py-opensonic's media types (`id` stays a string: song ids are video ids).
+_JSON_INT_ATTRS = frozenset({
+    "albumCount", "bitRate", "bookmarkPosition", "bpm", "channelCount", "code",
+    "count", "discNumber", "duration", "lastModified", "playCount", "position",
+    "samplingRate", "size", "songCount", "track", "userRating", "year",
+})
+_JSON_FLOAT_ATTRS = frozenset({"averageRating"})
+_JSON_BOOL_ATTRS = frozenset({"isDir", "isVideo", "public", "readonly", "isCompilation"})
+
+
+def _json_value(name: str, value: str):
+    try:
+        if name in _JSON_INT_ATTRS:
+            return int(value)
+        if name in _JSON_FLOAT_ATTRS:
+            return float(value)
+    except ValueError:
+        return value
+    if name in _JSON_BOOL_ATTRS:
+        return value == "true"
+    return value
+
+
+def _json_element(element: ET.Element, depth: int) -> dict:
+    """Subsonic's JSON mapping: attributes become keys, child elements are
+    grouped by tag. Below the response's direct children every element is a
+    list member in the schema (song, entry, album, artist, index, playlist…),
+    so it is always an array — even with one item, which py-opensonic needs."""
+    out = {name: _json_value(name, value) for name, value in element.attrib.items()
+           if name != "xmlns"}
+    for child in element:
+        node = _json_element(child, depth + 1)
+        if depth >= 1:
+            out.setdefault(child.tag, []).append(node)
+        else:
+            out[child.tag] = node
+    return out
+
+
+def _json_response(root: ET.Element, status_code: int = 200) -> Response:
+    body = _json_element(root, 0)
+    body["openSubsonic"] = False
+    return Response(content=json.dumps({"subsonic-response": body}, ensure_ascii=False),
+                    media_type="application/json", status_code=status_code)
+
+
 def _xml_response(root: ET.Element, status_code: int = 200) -> Response:
+    if _WANT_JSON.get():
+        return _json_response(root, status_code)
     # encoding="utf-8" makes ElementTree omit its own <?xml ...?> line (it
     # only emits one for encodings other than utf-8/us-ascii/unicode), so
     # prepending ours here does not produce a duplicate declaration.
@@ -983,7 +1039,7 @@ _register_stub("getNewestPodcasts", "newestPodcasts")
 _register_stub("getInternetRadioStations", "internetRadioStations")
 _register_stub("getSimilarSongs2", "similarSongs2")
 
-_HANDLERS["getOpenSubsonicExtensions"] = _noop_ok
+_register_stub("getOpenSubsonicExtensions", "openSubsonicExtensions")
 _HANDLERS["scrobble"] = _scrobble
 _HANDLERS["setRating"] = _noop_ok
 _HANDLERS["deletePodcastEpisode"] = _noop_ok
@@ -1043,6 +1099,7 @@ async def rest_dispatch(action: str, request: Request) -> Response:
     extra = "".join(f" {name}={params.get(name)}"
                     for name in _LOGGED_VALUES.get(action, ()))
     logger.info("rest action=%s params=%s%s", action, sorted(params.keys()), extra)
+    _WANT_JSON.set(params.get("f") == "json")
 
     if not _authenticate(params):
         return _error_response(40, "Wrong username or password")
