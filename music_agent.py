@@ -18,6 +18,7 @@ from ranking import rank_playlists, rank_tracks
 
 
 MAX_PLAYLIST_SIZE = 50
+RECOMMENDATION_PAGES = 4  # up to 200 of the 1000 recommendations ListenBrainz keeps
 LISTENBRAINZ_BASE_URL = "https://api.listenbrainz.org"
 logger = logging.getLogger(__name__)
 
@@ -201,12 +202,19 @@ async def run_weekly(
     claim_token = claim["claim_token"]
     try:
         await sync_unsent_listens(lib, lb, int(now_utc.timestamp() * 1000))
-        recommendations = await lb.get_recommendation_mbids(user, 50) or []
-        ordered_recommendations = [
-            row for row in recommendations[:50] if row.get("recording_mbid")
-        ]
-        mbids = list(dict.fromkeys(row["recording_mbid"] for row in ordered_recommendations))
-        metadata = await lb.get_recording_metadata(mbids)
+        # ListenBrainz rebuilds CF recommendations rarely: on 2026-11-02 the list
+        # was from 10-23 and its top 50 were all in the library already, so the
+        # week came out empty. Look past the top, 50 per page (metadata limit).
+        ordered_recommendations = []
+        metadata = []
+        for offset in range(0, RECOMMENDATION_PAGES * 50, 50):
+            recommendations = (await lb.get_recommendation_mbids(user, 50, offset) or [])[:50]
+            page = [row for row in recommendations if row.get("recording_mbid")]
+            ordered_recommendations += page
+            metadata += await lb.get_recording_metadata(
+                list(dict.fromkeys(row["recording_mbid"] for row in page)))
+            if len(recommendations) < 50:
+                break
         metadata_by_mbid = {
             item.get("recording_mbid"): item for item in metadata if item.get("recording_mbid")
         }

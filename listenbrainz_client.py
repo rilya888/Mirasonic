@@ -56,11 +56,11 @@ class ListenBrainzClient:
         )
         response.raise_for_status()
 
-    async def get_recommendation_mbids(self, user: str, count: int) -> list[dict]:
+    async def get_recommendation_mbids(self, user: str, count: int, offset: int = 0) -> list[dict]:
         """Return collaborative-filtering recording recommendations for a user."""
         response = await self.client.get(
             f"/1/cf/recommendation/user/{user}/recording",
-            params={"count": count, "offset": 0},
+            params={"count": count, "offset": offset},
         )
         if response.status_code == 204:
             return []

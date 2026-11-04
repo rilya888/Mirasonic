@@ -656,7 +656,17 @@ async def get_adts(video_id: str) -> bytes:
             _stream_cache.pop(video_id, None)
             data = await _download(await get_stream_url(video_id))
         if data is not None:
-            audio = await _remux_to_adts(data)
+            try:
+                audio = await _remux_to_adts(data)
+            except UpstreamError as exc:
+                # A cached URL can also go bad without an HTTP error: measured
+                # 2026-11-04, googlevideo answered 2xx with bytes ffmpeg could not
+                # read, and the same track 502'd five to seven times in a row.
+                # The same fresh resolve as UpstreamRefused plays it.
+                logger.info("stream video_id=%s unplayable bytes (%s, %d B, head %r), resolving again",
+                            video_id, exc, len(data), data[:16])
+                _stream_cache.pop(video_id, None)
+                audio = await _remux_to_adts(await _download(await get_stream_url(video_id)))
         _adts_cache[video_id] = audio
         while len(_adts_cache) > ADTS_CACHE_SIZE:
             _adts_cache.pop(next(iter(_adts_cache)))  # dict keeps insertion order

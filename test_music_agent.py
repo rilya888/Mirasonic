@@ -24,12 +24,12 @@ class FakeListenBrainz:
     async def submit_listens(self, events):
         self.submitted.append(list(events))
 
-    async def get_recommendation_mbids(self, user, count):
+    async def get_recommendation_mbids(self, user, count, offset=0):
         assert count == 50
-        return self.recommendations
+        return self.recommendations[offset:offset + count]
 
     async def get_recording_metadata(self, mbids):
-        return self.metadata
+        return [item for item in self.metadata if item.get("recording_mbid") in mbids]
 
     async def get_fresh_releases(self, user, days=14):
         assert days == 14
@@ -131,6 +131,32 @@ async def test_weekly_run_skips_known_library_song_including_playlist_only_song(
     assert result == {"status": "completed", "added": 0, "playlist_id": None}
     assert searched == []
     assert [p["name"] for p in lib.get_playlists()] == ["Manual"]
+
+
+@pytest.mark.asyncio
+async def test_weekly_run_looks_past_a_top_fifty_already_in_the_library(tmp_path, monkeypatch):
+    """2026-11-02: ListenBrainz still served the 10-23 list, its top 50 were all
+    known, and the week came out empty while 900+ unused ones sat further down."""
+    import music_agent
+
+    lib = library.Library(str(tmp_path / "library.db"))
+    playlist_id = lib.create_playlist("Manual")
+    known = [(f"old-{i}", f"Old {i}", "Old Artist", None, 180, None) for i in range(50)]
+    lib.update_playlist(playlist_id, "Manual", [], known)
+    recs = [{"recording_mbid": f"mbid-{i}", "score": 1.0} for i in range(51)]
+    meta = [recording(f"mbid-{i}", f"Old {i}", "Old Artist") for i in range(50)]
+    meta.append(recording("mbid-50"))
+    lb = FakeListenBrainz(recs, meta)
+
+    async def search(**kwargs):
+        return {"tracks": [track()], "continuation": None}
+
+    monkeypatch.setattr(main, "search", search)
+    result = await music_agent.run_weekly(
+        lib, lb, "listener", datetime(2026, 8, 24, tzinfo=timezone.utc), 30
+    )
+
+    assert result["added"] == 1
 
 
 @pytest.mark.asyncio
