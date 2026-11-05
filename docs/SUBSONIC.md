@@ -674,6 +674,8 @@ search cache, so `getCoverArt`, `getSong` and `getAlbum` work on them.
   an empty `getArtist`. No `*ImageUrl`, `lastFmUrl` or `musicBrainzId`: an image
   URL would break the §5 rule, and the others have no source (D-013).
 - **`getAlbumInfo2`** also takes a song id. A single with no album page, or an
-  album whose title and artist do not match exactly, answers empty.
+  album whose artist does not match, answers empty. The title must match
+  exactly or be the listed title plus an edition suffix, and an exact match
+  wins.
 - **JSON:** `biography` and `notes` are strings, unlike every other child
   element, and `song` and `similarArtist` are always arrays, even empty.

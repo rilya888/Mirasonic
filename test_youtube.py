@@ -564,6 +564,32 @@ def test_album_info_matches_artist_as_well_as_title(lib):
     assert get("getAlbumInfo2", id="k1")["albumInfo"] == {"notes": "Album notes."}
 
 
+def albums_page(*rows):
+    def handler(request):
+        if request.url.path.endswith("/search"):
+            return httpx.Response(200, json=search_page(*rows))
+        browse_id = json.loads(request.content)["browseId"]
+        return httpx.Response(200, json=ALBUM_PAGE if browse_id == "MPREdisc" else {})
+    return handler
+
+
+def test_album_info_finds_an_edition_listed_under_the_plain_title(lib):
+    known(album="Disc OKNOTOK 1997 2017")
+    mock(albums_page(
+        entity_row("Disc", "MUSIC_PAGE_TYPE_ALBUM", "MPREwrong", artist_run("Somebody")),
+        entity_row("Discography", "MUSIC_PAGE_TYPE_ALBUM", "MPREwrong", artist_run("Band")),
+        entity_row("Disc", "MUSIC_PAGE_TYPE_ALBUM", "MPREdisc", artist_run("Band"))))
+    assert get("getAlbumInfo2", id="k1")["albumInfo"] == {"notes": "Album notes."}
+
+
+def test_album_info_prefers_the_exact_title_over_an_edition(lib):
+    known(album="Disc Two")
+    mock(albums_page(
+        entity_row("Disc", "MUSIC_PAGE_TYPE_ALBUM", "MPREwrong", artist_run("Band")),
+        entity_row("Disc Two", "MUSIC_PAGE_TYPE_ALBUM", "MPREdisc", artist_run("Band"))))
+    assert get("getAlbumInfo2", id="k1")["albumInfo"] == {"notes": "Album notes."}
+
+
 ACTIONS = [("getTopSongs", "topSongs", {"song": []}),
            ("getSimilarSongs", "similarSongs", {"song": []}),
            ("getSimilarSongs2", "similarSongs2", {"song": []}),
@@ -643,9 +669,11 @@ def test_live_top_songs_are_the_most_played():
 def test_live_radio_and_info():
     async def fetch():
         return (await main.similar_tracks("zFYEYRcjK2g"), await main.artist_info("Radiohead"),
-                await main.album_notes("Radiohead", "Pablo Honey"))
+                await main.album_notes("Radiohead", "Pablo Honey"),
+                await main.album_notes("Radiohead", "OK Computer OKNOTOK 1997 2017"))
 
-    radio, info, notes = asyncio.run(fetch())
+    radio, info, notes, edition = asyncio.run(fetch())
     assert len(radio) > 10
     assert "Abingdon" in info["biography"] and info["similar"]
     assert "Radiohead" in notes
+    assert "Radiohead" in edition

@@ -647,20 +647,29 @@ async def artist_info(name: str) -> dict:
 
 
 async def album_notes(artist: str, album: str) -> str:
-    """The album's description, "" when YouTube has none or no such album."""
+    """The album's description, "" when YouTube has none or no such album.
+
+    An exact title wins. Otherwise a row counts when `album` is its title plus
+    an edition suffix: "OK Computer OKNOTOK 1997 2017" is listed as "OK Computer".
+    """
     results = await innertube(
         "search", query=f"{album} {artist}", params=SEARCH_PARAMS_ALBUMS)
+    albums = []
     for row in _find_all(results, "musicResponsiveListItemRenderer"):
         runs = _flex_runs(row)
         if (_page_type(row) == "MUSIC_PAGE_TYPE_ALBUM" and runs
-                and _fold(runs[0].get("text", "")) == _fold(album)
                 and any(_page_type(r) == "MUSIC_PAGE_TYPE_ARTIST"
                         and _fold(r.get("text", "")) == _fold(artist) for r in runs)):
-            page = await innertube(
-                "browse", browseId=row["navigationEndpoint"]["browseEndpoint"]["browseId"])
-            shelves = _find_all(page, "musicDescriptionShelfRenderer")
-            return _text(shelves[0].get("description")) if shelves else ""
-    return ""
+            albums.append((runs[0].get("text", ""), row))
+    row = next((row for title, row in albums if _fold(title) == _fold(album)), None) or next(
+        (row for title, row in albums
+         if title and album.casefold().startswith(title.casefold() + " ")), None)
+    if row is None:
+        return ""
+    page = await innertube(
+        "browse", browseId=row["navigationEndpoint"]["browseEndpoint"]["browseId"])
+    shelves = _find_all(page, "musicDescriptionShelfRenderer")
+    return _text(shelves[0].get("description")) if shelves else ""
 
 
 def _extract_expire(url: str) -> Optional[int]:
