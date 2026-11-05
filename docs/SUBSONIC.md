@@ -17,9 +17,10 @@ background playback, lock screen, AirPlay, queue, playlists, offline cache. In
 exchange it demands a server that speaks Subsonic.
 
 This server already does the two hard things — search YouTube Music and serve
-bytes. The Subsonic layer adds no new data sources; it **repackages the
-existing ones** into the shape a client understands, and adds exactly one new
-entity: a stored playlist library.
+bytes. The Subsonic layer **repackages those** into the shape a client
+understands, and adds exactly one new entity: a stored playlist library. The
+one further source is YouTube Music's own artist, album and radio pages, read
+for the endpoints in §11.
 
 ```text
 Subsonic client
@@ -628,7 +629,6 @@ empty contents, which is enough.
 | `getLicense` | `<license valid="true"/>` |
 | `getPodcasts`, `getNewestPodcasts` | `<podcasts/>`, `<newestPodcasts/>` |
 | `getInternetRadioStations` | `<internetRadioStations/>` |
-| `getSimilarSongs2` | `<similarSongs2/>` |
 | `getOpenSubsonicExtensions` | empty success — the client concludes there are none |
 | `setRating`, `deletePodcastEpisode` | empty success, action ignored |
 | `getRandomSongs` | a random selection of `size` rows from `songs` |
@@ -645,3 +645,35 @@ Podcasts, radio, video, jukebox, chat, sharing, bookmarks, transcoding,
 multiple users and permissions (`getUser` describes the one configured user and
 `adminRole` is false), `getLyricsBySongId`, library scanning. Each either has no
 source or falls outside the project's scope.
+
+## 11. Endpoints that read YouTube Music live
+
+Every one of these answers an empty success when YouTube Music fails, times out
+(25 s budget) or changes shape, and for an id it cannot resolve or a missing
+parameter: an error here is fatal or retried by clients, an empty list is not.
+`ar-`/`al-` ids are one-way hashes, so an artist or album resolves only if a
+track of it is in the library or the search cache. Returned songs enter the
+search cache, so `getCoverArt`, `getSong` and `getAlbum` work on them.
+
+| Action | Source | Response |
+|---|---|---|
+| `getTopSongs?artist=&count=50` | the artist page's "Top songs" playlist | `<topSongs><song/></topSongs>` |
+| `getSimilarSongs?id=&count=50`, `getSimilarSongs2` | the `/next` radio of the track | `<similarSongs><song/></similarSongs>`, `<similarSongs2>…` |
+| `getArtistInfo2?id=&count=20&includeNotPresent=false` | the artist page | `<artistInfo2><biography/><similarArtist/></artistInfo2>` |
+| `getAlbumInfo2?id=` | the album page | `<albumInfo><notes/></albumInfo>` |
+
+- **`getTopSongs` is not YouTube's order.** That list is an editorial mix, so it
+  is sorted here by the play count on each row, one version per title, without
+  rows that do not credit the artist. `artist` is a name and must match exactly,
+  ignoring case, accents and punctuation: a lookalike's songs are worse than none.
+- **`getSimilarSongs` and `getSimilarSongs2`** take a song, album or artist id.
+  An album seeds the radio with its first known track, an artist with their top
+  song. The seed itself is left out.
+- **`getArtistInfo2`:** `similarArtist` holds only artists in the library unless
+  `includeNotPresent=true`; the others have `albumCount="0"`, no `coverArt`, and
+  an empty `getArtist`. No `*ImageUrl`, `lastFmUrl` or `musicBrainzId`: an image
+  URL would break the §5 rule, and the others have no source (D-013).
+- **`getAlbumInfo2`** also takes a song id. A single with no album page, or an
+  album whose title and artist do not match exactly, answers empty.
+- **JSON:** `biography` and `notes` are strings, unlike every other child
+  element, and `song` and `similarArtist` are always arrays, even empty.

@@ -26,7 +26,7 @@ Mirasonic  (FastAPI, your machine)
 ```
 
 - **Small Python services.** One playback worker by default, plus an opt-in
-  weekly recommendation agent. About 3,100 lines of code, 263 tests, one SQLite
+  weekly recommendation agent. About 3,100 lines of code, 369 tests, one SQLite
   file.
 - **Nothing is written to disk except the library.** The container runs
   `read_only: true`. Audio is never stored anywhere.
@@ -205,7 +205,7 @@ Details, scoring and the re-import model: [docs/SPOTIFY-IMPORT.md](docs/SPOTIFY-
 
 ```sh
 pip install -r requirements.txt
-python -m pytest -q            # 263 tests, no network
+python -m pytest -q            # 369 tests, no network
 python -m pytest -m live       # hits YouTube for real
 ```
 

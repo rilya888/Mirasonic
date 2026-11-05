@@ -15,10 +15,15 @@ import pytest
 import main
 
 
+def _reset():
+    main._upstream_client = None
+    main._adts_cache.clear()
+    main._response_cache.clear()
+    main._inflight.clear()
+
+
 @pytest.fixture(autouse=True)
 def _fresh_upstream_client():
-    main._upstream_client = None
-    main._adts_cache.clear()
+    _reset()
     yield
-    main._upstream_client = None
-    main._adts_cache.clear()
+    _reset()

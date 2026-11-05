@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
@@ -214,9 +215,13 @@ _JSON_BOOL_ATTRS = frozenset({
 # An element with no children has no list key at all, and Feishin calls .map
 # on these without a guard. XML has no equivalent, so Amperfy sees no change.
 _JSON_LIST_KEYS = {
-    "albumList2": "album", "genres": "genre", "musicFolders": "musicFolder",
-    "similarSongs": "song", "similarSongs2": "song",
+    "albumList2": "album", "artistInfo2": "similarArtist", "genres": "genre",
+    "musicFolders": "musicFolder", "similarSongs": "song", "similarSongs2": "song",
+    "topSongs": "song",
 }
+# The rare schema elements that hold text rather than attributes: a plain
+# string in JSON, not a one-item list.
+_JSON_TEXT_TAGS = frozenset({"biography", "notes"})
 
 
 def _json_value(name: str, value: str):
@@ -242,6 +247,9 @@ def _json_element(element: ET.Element, depth: int) -> dict:
     if depth == 1 and element.tag in _JSON_LIST_KEYS:
         out[_JSON_LIST_KEYS[element.tag]] = []
     for child in element:
+        if child.tag in _JSON_TEXT_TAGS:
+            out[child.tag] = child.text or ""
+            continue
         node = _json_element(child, depth + 1)
         if depth >= 1:
             out.setdefault(child.tag, []).append(node)
@@ -366,6 +374,27 @@ async def _resolve_durations(video_ids: list[str]) -> None:
     await asyncio.gather(*(resolve_one(v) for v in todo))
 
 
+def _remember_track(track: dict) -> None:
+    """Everything handed to a client must land in the cache: getCoverArt and
+    getAlbum find a track there, and nowhere else until it enters the library."""
+    if _cache_get(track["id"]) is None:
+        _cache_put(track["id"], {
+            "title": track["title"],
+            "artist": track["artist"],
+            "album": track.get("album"),  # None for singles — _add_song_element
+                                           # falls back to the title, never empty.
+            "artworkURL": track.get("artworkURL"),
+            # main.search() already resolves this from InnerTube's search
+            # response (measured 2026-08-27: 1707/1707 candidates carried
+            # it, D-014). Discarding it here was the actual bug: it forced
+            # _resolve_durations to hit /youtubei/v1/player once per track
+            # of every page, 20 requests where zero were needed. Left as
+            # None only for the rare track that genuinely has no value,
+            # so the fallback resolve below still has something to do.
+            "duration": track.get("durationSeconds"),
+        })
+
+
 async def _search_songs(query: str, offset: int, count: int) -> list[tuple[str, dict]]:
     needed = offset + count
     tracks: list[dict] = []
@@ -389,22 +418,7 @@ async def _search_songs(query: str, offset: int, count: int) -> list[tuple[str, 
 
     window = tracks[offset:offset + count]
     for track in window:
-        if _cache_get(track["id"]) is None:
-            _cache_put(track["id"], {
-                "title": track["title"],
-                "artist": track["artist"],
-                "album": track.get("album"),  # None for singles — _add_song_element
-                                               # falls back to the title, never empty.
-                "artworkURL": track.get("artworkURL"),
-                # main.search() already resolves this from InnerTube's search
-                # response (measured 2026-08-27: 1707/1707 candidates carried
-                # it, D-014). Discarding it here was the actual bug: it forced
-                # _resolve_durations to hit /youtubei/v1/player once per track
-                # of every page, 20 requests where zero were needed. Left as
-                # None only for the rare track that genuinely has no value,
-                # so the fallback resolve below still has something to do.
-                "duration": track.get("durationSeconds"),
-            })
+        _remember_track(track)
 
     await _resolve_durations([track["id"] for track in window])
     return [(track["id"], _cache_get(track["id"])) for track in window]
@@ -444,16 +458,18 @@ async def _stream_or_download(params, request: Request) -> Response:
 # ---------------------------------------------------------------------------
 
 async def _proxy_get(url: str) -> Response:
-    client = main.get_upstream_client()
+    async def fetch():
+        response = await main.upstream("get", url)
+        return response.content, response.headers.get("content-type", "image/jpeg")
+
     try:
-        upstream = await client.get(url)
-    except httpx.HTTPError:
+        content, content_type = await main.cached(("cover", url), fetch)
+    except httpx.HTTPStatusError:
+        return _error_response(70, "Cover art not found")
+    except (httpx.HTTPError, TimeoutError):
         logger.info("getCoverArt upstream fetch failed url=%s", url)
         return _error_response(0, "Cover art fetch failed")
-    if upstream.status_code >= 400:
-        return _error_response(70, "Cover art not found")
-    content_type = upstream.headers.get("content-type", "image/jpeg")
-    return Response(content=upstream.content, media_type=content_type)
+    return Response(content=content, media_type=content_type)
 
 
 async def _get_cover_art(params, request: Request) -> Response:
@@ -714,6 +730,113 @@ async def _get_artist(params, request: Request) -> Response:
     for album_id, album_songs in by_album.items():
         _add_album_element(element, album_id, album_songs, with_songs=False)
     return _xml_response(root)
+
+
+# ---------------------------------------------------------------------------
+# getTopSongs / getSimilarSongs(2) / getArtistInfo2 / getAlbumInfo2 — live from
+# YouTube Music. Any failure is an empty success, never an error: an artist
+# page opens with these calls, and clients treat errors as fatal or retry them
+# (docs/PITFALLS.md #8). The ids are one-way hashes, so an artist or album is
+# only reachable once its name is in _known_songs(); otherwise, empty too.
+# ---------------------------------------------------------------------------
+# Under a client's patience, over one upstream call. What is still running when
+# it expires finishes in the background and fills the cache for the next ask.
+UPSTREAM_BUDGET_SECONDS = 25
+_ARTIST_ID_RE = re.compile(r"ar-[0-9a-f]{16}")
+_ALBUM_ID_RE = re.compile(r"al-[0-9a-f]{16}")
+_XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _upstream_handler(tag: str, fill):
+    async def handler(params, request: Request) -> Response:
+        root = _root("ok")
+        element = ET.SubElement(root, tag)
+        try:
+            await asyncio.wait_for(fill(element, params), UPSTREAM_BUDGET_SECONDS)
+        except Exception:
+            logger.exception("%s upstream failure, answering empty", tag)
+            element.clear()
+        return _xml_response(root)
+    return handler
+
+
+def _count_param(params, default: int) -> int:
+    return max(0, _int_param(params, "count", default))
+
+
+def _add_tracks(element: ET.Element, tracks: list[dict], count: int) -> None:
+    for track in tracks[:count]:
+        _remember_track(track)
+        _add_song_element(element, "song", track["id"], _cache_get(track["id"]))
+
+
+def _artist_name(artist_id: str) -> Optional[str]:
+    return next((meta["artist"] for _, meta in _known_songs()
+                 if meta.get("artist") and _artist_id(meta["artist"]) == artist_id), None)
+
+
+def _album_songs(album_id: str) -> list[tuple[str, dict]]:
+    return [(video_id, meta) for video_id, meta in _known_songs()
+            if _album_id(meta.get("artist") or "", _album_name(meta)) == album_id]
+
+
+async def _radio_seed(item_id: str) -> Optional[str]:
+    """Subsonic takes a song, album or artist id here. YouTube's radio starts
+    from a track, so an album is its first track, an artist their top song."""
+    if _ARTIST_ID_RE.fullmatch(item_id):
+        name = _artist_name(item_id)
+        top = await main.artist_top_songs(name) if name else []
+        return top[0]["id"] if top else None
+    if _ALBUM_ID_RE.fullmatch(item_id):
+        songs = _album_songs(item_id)
+        return songs[0][0] if songs else None
+    return item_id or None
+
+
+async def _fill_similar_songs(element: ET.Element, params) -> None:
+    seed = await _radio_seed(params.get("id", ""))
+    if seed:
+        _add_tracks(element, await main.similar_tracks(seed), _count_param(params, 50))
+
+
+async def _fill_top_songs(element: ET.Element, params) -> None:
+    artist = params.get("artist", "").strip()
+    if artist:
+        _add_tracks(element, await main.artist_top_songs(artist), _count_param(params, 50))
+
+
+async def _fill_artist_info(element: ET.Element, params) -> None:
+    name = _artist_name(params.get("id", ""))
+    if not name:
+        return
+    info = await main.artist_info(name)
+    if info["biography"]:
+        ET.SubElement(element, "biography").text = _XML_ILLEGAL_RE.sub("", info["biography"])
+
+    library: dict[str, list] = {}
+    for video_id, meta in _known_songs():
+        library.setdefault(meta.get("artist") or "", []).append((video_id, meta))
+    include_all = params.get("includeNotPresent") == "true"
+    similar = [other for other in info["similar"] if include_all or other in library]
+    # No artist image anywhere here: a URL would send the client out to Google
+    # (docs/SUBSONIC.md §5), and getCoverArt serves tracks and playlists only.
+    for other in similar[:_count_param(params, 20)]:
+        songs = library.get(other, [])
+        attrib = {"id": _artist_id(other), "name": other,
+                  "albumCount": str(len(_group_by_album(songs)))}
+        if songs:
+            attrib["coverArt"] = songs[0][0]
+        ET.SubElement(element, "similarArtist", attrib)
+
+
+async def _fill_album_info(element: ET.Element, params) -> None:
+    item_id = params.get("id", "")
+    songs = _album_songs(item_id)
+    meta = songs[0][1] if songs else dict(_known_songs()).get(item_id)
+    if meta and meta.get("artist"):
+        notes = await main.album_notes(meta["artist"], _album_name(meta))
+        if notes:
+            ET.SubElement(element, "notes").text = _XML_ILLEGAL_RE.sub("", notes)
 
 
 # ---------------------------------------------------------------------------
@@ -1067,14 +1190,13 @@ _register_stub("getMusicFolders", "musicFolders")
 _register_stub("getPodcasts", "podcasts")
 _register_stub("getNewestPodcasts", "newestPodcasts")
 _register_stub("getInternetRadioStations", "internetRadioStations")
-_register_stub("getSimilarSongs2", "similarSongs2")
 # Music Assistant opens every artist/album page with an *Info2 call and treats
-# "Unsupported action" as fatal; empty answers are what a server without
-# last.fm returns.
-_register_stub("getSimilarSongs", "similarSongs")
-_register_stub("getArtistInfo2", "artistInfo2")
-_register_stub("getAlbumInfo2", "albumInfo")
-_register_stub("getTopSongs", "topSongs")
+# "Unsupported action" as fatal.
+_HANDLERS["getSimilarSongs"] = _upstream_handler("similarSongs", _fill_similar_songs)
+_HANDLERS["getSimilarSongs2"] = _upstream_handler("similarSongs2", _fill_similar_songs)
+_HANDLERS["getTopSongs"] = _upstream_handler("topSongs", _fill_top_songs)
+_HANDLERS["getArtistInfo2"] = _upstream_handler("artistInfo2", _fill_artist_info)
+_HANDLERS["getAlbumInfo2"] = _upstream_handler("albumInfo", _fill_album_info)
 _register_stub("getBookmarks", "bookmarks")
 _register_stub("getLicense", "license", {"valid": "true"})
 

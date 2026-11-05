@@ -311,7 +311,7 @@ class FakeSearchClient:
                 pass
         return R()
 
-    async def post(self, url, params=None, json=None, headers=None):
+    async def post(self, url, params=None, json=None, headers=None, timeout=None):
         FakeSearchClient.captured_body = json
         FakeSearchClient.captured_params = params
         payload = FakeSearchClient.payload
@@ -327,7 +327,7 @@ class FakeSearchClient:
 
 def test_search_sends_songs_filter(monkeypatch):
     monkeypatch.setattr(main, "_config_cache", None)
-    monkeypatch.setattr(main.httpx, "AsyncClient", FakeSearchClient)
+    monkeypatch.setattr(main, "get_upstream_client", lambda: FakeSearchClient())
     FakeSearchClient.payload = shelf_with_continuation([list_item("a1", "T", "A")], "TOK")
 
     resp = TestClient(main.app).get("/search?q=green+day")
@@ -340,7 +340,7 @@ def test_search_sends_songs_filter(monkeypatch):
 
 def test_search_with_continuation_omits_query(monkeypatch):
     monkeypatch.setattr(main, "_config_cache", None)
-    monkeypatch.setattr(main.httpx, "AsyncClient", FakeSearchClient)
+    monkeypatch.setattr(main, "get_upstream_client", lambda: FakeSearchClient())
     FakeSearchClient.payload = {"continuationContents": {"musicShelfContinuation": {
         "contents": [list_item("b1", "T", "A")]}}}
 
@@ -373,7 +373,8 @@ class FakeAsyncClient:
     async def get(self, url, headers=None, timeout=None):
         FakeAsyncClient.captured_headers = headers
         return httpx.Response(206, content=FakeAsyncClient.body,
-                              headers={"content-range": "bytes 0-9/10"})
+                              headers={"content-range": "bytes 0-9/10"},
+                              request=httpx.Request("GET", url))
 
     async def aclose(self):
         pass
@@ -558,7 +559,7 @@ def test_stream_refused_url_is_evicted_and_resolved_again(monkeypatch):
     class RefusesDead(FakeAsyncClient):
         async def get(self, url, headers=None, timeout=None):
             if "dead" in url:
-                return httpx.Response(403)
+                return httpx.Response(403, request=httpx.Request("GET", url))
             return await super().get(url, headers, timeout)
 
     monkeypatch.setattr(main, "get_upstream_client", lambda: RefusesDead())

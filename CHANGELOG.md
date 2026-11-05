@@ -2,6 +2,21 @@
 
 All notable changes to Mirasonic are documented here.
 
+## [Unreleased]
+
+### Added
+
+- `getTopSongs`, `getSimilarSongs`, `getSimilarSongs2`, `getArtistInfo2` and
+  `getAlbumInfo2` return real data from YouTube Music instead of empty stubs,
+  and an empty success if it fails. Top songs are ranked by actual play count.
+
+### Changed
+
+- Every call to YouTube Music goes through one layer in `main.py`: timeouts,
+  retry on 429 and 5xx with a pause, a 5-minute cache, and merging of identical
+  concurrent requests. `/search` and other non-Subsonic callers still report an
+  outage as an error.
+
 ## [0.2.0] - 2026-08-31
 
 ### Added

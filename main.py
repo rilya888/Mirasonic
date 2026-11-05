@@ -6,11 +6,14 @@ GET /stream/{video_id}      -> proxied audio bytes (Range-aware)
 No auth, no DB, no disk writes. Everything cached is a plain in-memory dict.
 """
 import asyncio
+import json
 import logging
 import os
 import re
 import time
-from typing import Optional
+import unicodedata
+from collections import OrderedDict
+from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlparse, parse_qs
 
 import httpx
@@ -69,6 +72,8 @@ STREAM_EXPIRE_MARGIN_SECONDS = 600  # refresh 10 min before the signed URL expir
 # a 2026-08-26 measurement returned 5 songs. With it: 20 songs per page and a
 # continuation token. Same value ytmusicapi uses.
 SEARCH_PARAMS_SONGS = "EgWKAQIIAWoMEA4QChADEAQQCRAF"
+SEARCH_PARAMS_ARTISTS = "EgWKAQIgAWoMEA4QChADEAQQCRAF"
+SEARCH_PARAMS_ALBUMS = "EgWKAQIYAWoMEA4QChADEAQQCRAF"
 SEARCH_PAGE_SIZE = 20
 YDL_OPTS = {
     "quiet": True,
@@ -77,6 +82,7 @@ YDL_OPTS = {
     "format": "bestaudio[ext=m4a]/bestaudio",
     "socket_timeout": 20,
 }
+RETRYABLE_RESOLVE = re.compile(r"HTTP Error (429|5\d\d)")
 UNAVAILABLE_MARKERS = (
     "unavailable",
     "private",
@@ -124,36 +130,161 @@ def get_upstream_client() -> httpx.AsyncClient:
     return _upstream_client
 
 
+# ---------------------------------------------------------------------------
+# The one way out to YouTube Music. Every HTTP call goes through upstream()
+# (timeout, overall deadline, retry on 429/5xx with a pause); InnerTube JSON
+# additionally goes through innertube() (short cache, identical concurrent calls
+# merged). Failures always propagate and are never cached: a remembered outage
+# would read as "nothing found", and spotify_import tells the two apart to
+# protect --replace. Turning a failure into an empty answer is the caller's call.
+# ---------------------------------------------------------------------------
+UPSTREAM_TIMEOUT = httpx.Timeout(10)  # per operation, the way httpx counts it
+UPSTREAM_DEADLINE = 20  # seconds for one call, retries and pauses included
+UPSTREAM_ATTEMPTS = 3
+UPSTREAM_PAUSE = 0.5  # doubles per retry
+# Low on purpose: _download pauses while holding _adts_lock, and no client
+# waits out a Retry-After of a minute anyway.
+UPSTREAM_MAX_PAUSE = 2.0
+RESOLVE_DEADLINE = 60  # one yt-dlp resolve, ~2 s when healthy
+CACHE_TTL_SECONDS = 300
+CACHE_SIZE = 32  # a /browse payload is ~1 MB of JSON
+
+_response_cache: "OrderedDict[tuple, tuple[float, Any]]" = OrderedDict()
+_inflight: dict[tuple, asyncio.Future] = {}
+
+
+def _retry_pause(attempt: int, retry_after: Optional[str] = None) -> float:
+    try:
+        pause = float(retry_after)
+    except (TypeError, ValueError):
+        pause = UPSTREAM_PAUSE * 2 ** attempt
+    return min(max(pause, 0), UPSTREAM_MAX_PAUSE)
+
+
+async def upstream(method: str, url: str, *, client: Optional[httpx.AsyncClient] = None,
+                   timeout=UPSTREAM_TIMEOUT, deadline: Optional[float] = UPSTREAM_DEADLINE,
+                   **kwargs) -> httpx.Response:
+    """A 2xx response or an exception: httpx.HTTPStatusError once 429/5xx
+    retries run out (any other status at once), httpx.TransportError, or
+    TimeoutError past the deadline."""
+    http = client or get_upstream_client()
+
+    async def attempts() -> httpx.Response:
+        for attempt in range(UPSTREAM_ATTEMPTS):
+            response = await getattr(http, method)(url, timeout=timeout, **kwargs)
+            try:
+                response.raise_for_status()
+                return response
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if attempt + 1 == UPSTREAM_ATTEMPTS or (status != 429 and status < 500):
+                    raise
+                pause = _retry_pause(attempt, exc.response.headers.get("retry-after"))
+                logger.info("upstream status=%s, retrying in %.1fs", status, pause)
+                await asyncio.sleep(pause)
+        raise AssertionError("unreachable")
+
+    return await asyncio.wait_for(attempts(), deadline)
+
+
+def _forget_inflight(key: tuple, task: asyncio.Future) -> None:
+    _inflight.pop(key, None)
+    if not task.cancelled():
+        task.exception()  # marks it retrieved even if every waiter was cancelled
+
+
+async def coalesce(key: tuple, fetch: Callable[[], Awaitable]):
+    """Concurrent calls with one key share one fetch. It runs as its own task,
+    so a client hanging up cannot fail the others waiting on the same result."""
+    task = _inflight.get(key)
+    if task is None:
+        task = _inflight[key] = asyncio.ensure_future(fetch())
+        task.add_done_callback(lambda done: _forget_inflight(key, done))
+    return await asyncio.shield(task)
+
+
+async def cached(key: tuple, fetch: Callable[[], Awaitable]):
+    """coalesce() plus a short TTL. Only successes are stored."""
+    hit = _response_cache.get(key)
+    if hit is not None and hit[0] > time.monotonic():
+        _response_cache.move_to_end(key)
+        return hit[1]
+
+    async def fill():
+        value = await fetch()
+        _response_cache[key] = (time.monotonic() + CACHE_TTL_SECONDS, value)
+        _response_cache.move_to_end(key)
+        while len(_response_cache) > CACHE_SIZE:
+            _response_cache.popitem(last=False)
+        return value
+
+    return await coalesce(key, fill)
+
+
+async def innertube(endpoint: str, url_params: Optional[dict] = None, **payload) -> dict:
+    """POST /youtubei/v1/{endpoint}. `url_params` land in the query string (the
+    continuation token of /search), `payload` in the body beside the context."""
+    async def fetch() -> dict:
+        client = get_upstream_client()
+        config = await get_innertube_config(client)
+        response = await upstream(
+            "post", f"{HOME_URL}youtubei/v1/{endpoint}",
+            params={"key": config["INNERTUBE_API_KEY"], "prettyPrint": "false",
+                    **(url_params or {})},
+            json={
+                "context": {"client": {
+                    "clientName": config["INNERTUBE_CLIENT_NAME"],
+                    "clientVersion": config["INNERTUBE_CLIENT_VERSION"],
+                    "hl": "en", "gl": REGION,
+                }},
+                **payload,
+            },
+            headers={
+                "Content-Type": "application/json",
+                "X-YouTube-Client-Name": "67",
+                "X-YouTube-Client-Version": config["INNERTUBE_CLIENT_VERSION"],
+                "User-Agent": USER_AGENT,
+            },
+        )
+        return response.json()
+
+    return await cached(
+        ("innertube", endpoint, json.dumps([url_params, payload], sort_keys=True)), fetch)
+
+
 
 async def get_innertube_config(client: httpx.AsyncClient) -> dict:
     """Fetch + cache INNERTUBE_API_KEY / CLIENT_NAME / CLIENT_VERSION from the
     YT Music homepage. Cached forever in-process — the page is 547 KB and the
     values live for hours, so re-fetching per search is wasteful."""
-    global _config_cache
     if _config_cache is not None:
         return _config_cache
-    resp = await client.get(
-        HOME_URL,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept-Language": "en-US,en;q=0.9",
-            # ponytail: EU-geolocated IPs get redirected to a GDPR consent
-            # page instead of the homepage; this is yt-dlp's own bypass cookie.
-            "Cookie": "SOCS=CAI",
-        },
-        follow_redirects=True,
-        timeout=20,
-    )
-    resp.raise_for_status()
-    html = resp.text
-    config = {}
-    for key in ("INNERTUBE_API_KEY", "INNERTUBE_CLIENT_NAME", "INNERTUBE_CLIENT_VERSION"):
-        match = re.search(rf'"{key}":"([^"]+)"', html)
-        if not match:
-            raise ValueError(f"missing {key} in homepage")
-        config[key] = match.group(1)
-    _config_cache = config
-    return config
+
+    async def fetch() -> dict:
+        global _config_cache
+        resp = await upstream(
+            "get", HOME_URL,
+            client=client,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept-Language": "en-US,en;q=0.9",
+                # ponytail: EU-geolocated IPs get redirected to a GDPR consent
+                # page instead of the homepage; this is yt-dlp's own bypass cookie.
+                "Cookie": "SOCS=CAI",
+            },
+            follow_redirects=True,
+        )
+        html = resp.text
+        config = {}
+        for key in ("INNERTUBE_API_KEY", "INNERTUBE_CLIENT_NAME", "INNERTUBE_CLIENT_VERSION"):
+            match = re.search(rf'"{key}":"([^"]+)"', html)
+            if not match:
+                raise ValueError(f"missing {key} in homepage")
+            config[key] = match.group(1)
+        _config_cache = config
+        return config
+
+    return await coalesce(("config",), fetch)
 
 
 def parse_duration(text: str) -> Optional[int]:
@@ -180,6 +311,17 @@ def _best_thumbnail(thumbnails: list) -> Optional[str]:
     if not thumbnails:
         return None
     return max(thumbnails, key=lambda t: t.get("width", 0) * t.get("height", 0)).get("url")
+
+
+def _page_type(node: dict) -> Optional[str]:
+    """What a run or a row links to: MUSIC_PAGE_TYPE_ARTIST, _ALBUM…"""
+    return (
+        node.get("navigationEndpoint", {})
+        .get("browseEndpoint", {})
+        .get("browseEndpointContextSupportedConfigs", {})
+        .get("browseEndpointContextMusicConfig", {})
+        .get("pageType")
+    )
 
 
 def _parse_item(renderer: dict) -> Optional[dict]:
@@ -209,13 +351,7 @@ def _parse_item(renderer: dict) -> Optional[dict]:
     album = None
     for column in flex_columns[1:]:
         for run in _runs(column, "musicResponsiveListItemFlexColumnRenderer"):
-            page_type = (
-                run.get("navigationEndpoint", {})
-                .get("browseEndpoint", {})
-                .get("browseEndpointContextSupportedConfigs", {})
-                .get("browseEndpointContextMusicConfig", {})
-                .get("pageType")
-            )
+            page_type = _page_type(run)
             if page_type == "MUSIC_PAGE_TYPE_ARTIST" and artist is None:
                 artist = run.get("text")
             elif page_type == "MUSIC_PAGE_TYPE_ALBUM" and album is None:
@@ -342,42 +478,189 @@ async def search(q: str = "", limit: int = SEARCH_PAGE_SIZE, continuation: str =
         return JSONResponse({"error": "empty_query"}, status_code=400)
     limit = max(1, min(50, limit))
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            config = await get_innertube_config(client)
-            params = {"key": config["INNERTUBE_API_KEY"], "prettyPrint": "false"}
-            body = {
-                "context": {
-                    "client": {
-                        "clientName": config["INNERTUBE_CLIENT_NAME"],
-                        "clientVersion": config["INNERTUBE_CLIENT_VERSION"],
-                        "hl": "en",
-                        "gl": REGION,
-                    }
-                }
-            }
-            if continuation:
-                params["continuation"] = continuation
-            else:
-                body["query"] = q
-                body["params"] = SEARCH_PARAMS_SONGS
-            resp = await client.post(
-                f"{HOME_URL}youtubei/v1/search",
-                params=params,
-                json=body,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-YouTube-Client-Name": "67",
-                    "X-YouTube-Client-Version": config["INNERTUBE_CLIENT_VERSION"],
-                    "User-Agent": USER_AGENT,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        if continuation:
+            data = await innertube("search", url_params={"continuation": continuation})
+        else:
+            data = await innertube("search", query=q, params=SEARCH_PARAMS_SONGS)
         tracks, next_token = parse_search_page(data, limit)
     except Exception:
         logger.exception("search upstream failure query=%r", q)
         return JSONResponse({"error": "upstream"}, status_code=502)
     return {"tracks": tracks, "continuation": next_token}
+
+
+# ---------------------------------------------------------------------------
+# /browse and /next, for the Subsonic artist and album pages. Shapes taken from
+# live responses, 2026-11-05. All of these raise on upstream failure.
+# ---------------------------------------------------------------------------
+PLAYS_RE = re.compile(r"([\d.,]+)\s*([KMB]?)\s+plays?")
+PLAYS_SCALE = {"": 1, "K": 1e3, "M": 1e6, "B": 1e9}
+
+
+def _find_all(node, key: str) -> list:
+    """Every value under `key` anywhere in the tree. The same renderer sits at
+    different depths on artist, album and playlist pages."""
+    found = []
+    if isinstance(node, dict):
+        for name, value in node.items():
+            if name == key:
+                found.append(value)
+            else:
+                found.extend(_find_all(value, key))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(_find_all(value, key))
+    return found
+
+
+def _text(node: dict) -> str:
+    return "".join(run.get("text", "") for run in (node or {}).get("runs", []))
+
+
+def _fold(name: str) -> str:
+    """Comparison key: "Beyonce" finds "Beyoncé", "Guns N' Roses" its curly
+    apostrophe. Names of nothing but punctuation stay as they are."""
+    decomposed = unicodedata.normalize("NFKD", name)
+    return "".join(c for c in decomposed if c.isalnum()).casefold() or name
+
+
+def _flex_runs(row: dict) -> list:
+    return [run for column in row.get("flexColumns", [])
+            for run in _runs(column, "musicResponsiveListItemFlexColumnRenderer")]
+
+
+def _plays(row: dict) -> int:
+    for run in _flex_runs(row):
+        match = PLAYS_RE.fullmatch(run.get("text", "").strip())
+        if match:
+            return int(float(match[1].replace(",", "")) * PLAYS_SCALE[match[2]])
+    return 0
+
+
+def parse_top_songs(rows: list, artist: str) -> list:
+    """Most played first, one version of each title.
+
+    The "Top songs" list is an editorial mix, not a chart. Measured 2026-11-05:
+    Beyonce's 4th row has 31M plays above rows with 1.2B, and Kino's list holds
+    "Группа крови" three times. Rows with no play count sort last in the order
+    YouTube gave them, so if the count ever vanishes the mix is what is left.
+
+    Rows not credited to this artist go too (Destiny's Child's "Say My Name",
+    804M, sits in Beyonce's list), unless that is every row: then the page
+    spells the name differently from the caller.
+    """
+    credited = [row for row in rows if any(
+        _page_type(run) == "MUSIC_PAGE_TYPE_ARTIST"
+        and _fold(run.get("text", "")) == _fold(artist) for run in _flex_runs(row))]
+    ranked = sorted(credited or rows, key=_plays, reverse=True)
+    best: dict[str, dict] = {}
+    for row in ranked:
+        track = _parse_item(row)
+        if track:
+            best.setdefault(_fold(track["title"]), track)
+    return list(best.values())
+
+
+def parse_radio(data: dict, seed: str) -> list:
+    tracks: dict[str, dict] = {}
+    for item in _find_all(data, "playlistPanelVideoRenderer"):
+        video_id = item.get("videoId")
+        title = _text(item.get("title"))
+        runs = item.get("longBylineText", {}).get("runs", [])
+        artist = next((r.get("text") for r in runs
+                       if _page_type(r) == "MUSIC_PAGE_TYPE_ARTIST"), None)
+        artist = artist or (runs[0].get("text") if runs else None)
+        if not video_id or video_id == seed or not title or not artist:
+            continue
+        tracks.setdefault(video_id, {
+            "id": video_id,
+            "title": title,
+            "artist": artist,
+            "album": next((r.get("text") for r in runs
+                           if _page_type(r) == "MUSIC_PAGE_TYPE_ALBUM"), None),
+            "artworkURL": _best_thumbnail(item.get("thumbnail", {}).get("thumbnails", [])),
+            "durationSeconds": parse_duration(_text(item.get("lengthText"))),
+        })
+    return list(tracks.values())
+
+
+def _artist_browse_id(data: dict, name: str) -> Optional[str]:
+    for row in _find_all(data, "musicResponsiveListItemRenderer"):
+        runs = _flex_runs(row)
+        if (_page_type(row) == "MUSIC_PAGE_TYPE_ARTIST" and runs
+                and _fold(runs[0].get("text", "")) == _fold(name)):
+            return row["navigationEndpoint"]["browseEndpoint"].get("browseId")
+        for run in runs:
+            if (_page_type(run) == "MUSIC_PAGE_TYPE_ARTIST"
+                    and _fold(run.get("text", "")) == _fold(name)):
+                return run["navigationEndpoint"]["browseEndpoint"].get("browseId")
+    return None
+
+
+async def _artist_page(name: str) -> Optional[dict]:
+    """The artist page for exactly this name, or None: the artist filter returns
+    lookalikes when there is no such artist, and someone else's songs under this
+    name are worse than none. Two artists sharing a name: YouTube's first wins.
+
+    Song rows are the fallback because that is where the names we hand out come
+    from, and they can differ from the artist card: measured 2026-11-05, the card
+    says "Kino", every one of its 100 tracks says "Кино"."""
+    for params in (SEARCH_PARAMS_ARTISTS, SEARCH_PARAMS_SONGS):
+        browse_id = _artist_browse_id(await innertube("search", query=name, params=params), name)
+        if browse_id:
+            return await innertube("browse", browseId=browse_id)
+    return None
+
+
+async def artist_top_songs(name: str) -> list:
+    page = await _artist_page(name)
+    shelves = _find_all(page, "musicShelfRenderer")
+    if not shelves:
+        return []
+    # The page shows five rows; bottomEndpoint is its "See all" playlist. An
+    # artist with few songs has none, and the five are the whole list.
+    rows = _find_all(shelves[0], "musicResponsiveListItemRenderer")
+    endpoint = shelves[0].get("bottomEndpoint", {}).get("browseEndpoint")
+    if endpoint and endpoint.get("browseId"):
+        playlist = await innertube(
+            "browse", browseId=endpoint["browseId"], params=endpoint.get("params"))
+        rows = _find_all(playlist, "musicResponsiveListItemRenderer") or rows
+    return parse_top_songs(rows, name)
+
+
+async def similar_tracks(video_id: str) -> list:
+    """The radio YouTube Music would start from this track, without the track."""
+    data = await innertube(
+        "next", videoId=video_id, playlistId=f"RDAMVM{video_id}", isAudioOnly=True)
+    return parse_radio(data, video_id)
+
+
+async def artist_info(name: str) -> dict:
+    """{"biography": str, "similar": [names]}; empty for an unknown artist."""
+    page = await _artist_page(name)
+    biography = "".join(
+        _text(shelf.get("description")) for shelf in _find_all(page, "musicDescriptionShelfRenderer")[:1])
+    # "Fans might also like" is the carousel of artists, whatever its title says.
+    similar = [_text(item.get("title")) for item in _find_all(page, "musicTwoRowItemRenderer")
+               if _page_type(item) == "MUSIC_PAGE_TYPE_ARTIST"]
+    return {"biography": biography, "similar": [name for name in similar if name]}
+
+
+async def album_notes(artist: str, album: str) -> str:
+    """The album's description, "" when YouTube has none or no such album."""
+    results = await innertube(
+        "search", query=f"{album} {artist}", params=SEARCH_PARAMS_ALBUMS)
+    for row in _find_all(results, "musicResponsiveListItemRenderer"):
+        runs = _flex_runs(row)
+        if (_page_type(row) == "MUSIC_PAGE_TYPE_ALBUM" and runs
+                and _fold(runs[0].get("text", "")) == _fold(album)
+                and any(_page_type(r) == "MUSIC_PAGE_TYPE_ARTIST"
+                        and _fold(r.get("text", "")) == _fold(artist) for r in runs)):
+            page = await innertube(
+                "browse", browseId=row["navigationEndpoint"]["browseEndpoint"]["browseId"])
+            shelves = _find_all(page, "musicDescriptionShelfRenderer")
+            return _text(shelves[0].get("description")) if shelves else ""
+    return ""
 
 
 def _extract_expire(url: str) -> Optional[int]:
@@ -406,8 +689,25 @@ async def get_stream_url(video_id: str) -> str:
     now = time.time()
     if cached and cached["expire"] - STREAM_EXPIRE_MARGIN_SECONDS > now:
         return cached["url"]
-    url = await asyncio.to_thread(_resolve_stream_sync, video_id)
-    expire = _extract_expire(url) or (now + 3600)
+    return await coalesce(("stream", video_id), lambda: _resolve_stream(video_id))
+
+
+async def _resolve_stream(video_id: str) -> str:
+    """yt-dlp under the upstream() rules. It speaks exceptions rather than
+    status codes. The deadline frees the caller; the thread itself ends at
+    socket_timeout, it cannot be killed."""
+    for attempt in range(UPSTREAM_ATTEMPTS):
+        try:
+            url = await asyncio.wait_for(
+                asyncio.to_thread(_resolve_stream_sync, video_id), RESOLVE_DEADLINE)
+            break
+        except DownloadError as exc:
+            # "Sign in to confirm you're not a bot" never matches: it is the
+            # captcha, and retrying feeds it (docs/PITFALLS.md #1).
+            if attempt + 1 == UPSTREAM_ATTEMPTS or not RETRYABLE_RESOLVE.search(str(exc)):
+                raise
+            await asyncio.sleep(_retry_pause(attempt))
+    expire = _extract_expire(url) or (time.time() + 3600)
     _stream_cache[video_id] = {"url": url, "expire": expire}
     return url
 
@@ -432,29 +732,7 @@ async def get_song_details(video_id: str) -> dict:
     """
     async with _player_semaphore:
         try:
-            client = get_upstream_client()
-            config = await get_innertube_config(client)
-            params = {"key": config["INNERTUBE_API_KEY"], "prettyPrint": "false"}
-            body = {
-                "context": {"client": {
-                    "clientName": config["INNERTUBE_CLIENT_NAME"],
-                    "clientVersion": config["INNERTUBE_CLIENT_VERSION"],
-                    "hl": "en", "gl": REGION,
-                }},
-                "videoId": video_id,
-            }
-            resp = await client.post(
-                f"{HOME_URL}youtubei/v1/player", params=params, json=body,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-YouTube-Client-Name": "67",
-                    "X-YouTube-Client-Version": config["INNERTUBE_CLIENT_VERSION"],
-                    "User-Agent": USER_AGENT,
-                },
-                timeout=20,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            data = await innertube("player", videoId=video_id)
         except Exception:
             logger.exception("get_song_details video_id=%s failed", video_id)
             return {"title": None, "artist": None, "duration": 0, "artwork": None}
@@ -579,17 +857,17 @@ async def _download(url: str) -> bytes:
     `Range: bytes=0-` the same 5.2 MB file arrives in 0.15 s. Four orders of
     magnitude, all of it resting on one header.
     """
-    client = get_upstream_client()
     last: Optional[Exception] = None
     for _ in range(DOWNLOAD_ATTEMPTS):
         try:
-            response = await client.get(
-                url, headers={"Range": "bytes=0-"}, timeout=DOWNLOAD_TIMEOUT)
+            response = await upstream(
+                "get", url, headers={"Range": "bytes=0-"}, timeout=DOWNLOAD_TIMEOUT,
+                deadline=None)
+        except httpx.HTTPStatusError as exc:
+            raise UpstreamRefused(f"upstream {exc.response.status_code}")
         except httpx.HTTPError as exc:
             last = exc  # cut off mid-transfer — just refetch, it costs 0.15 s
             continue
-        if response.status_code >= 400:
-            raise UpstreamRefused(f"upstream {response.status_code}")
         return response.content
     raise UpstreamError(f"upstream unreachable: {last!r}")
 

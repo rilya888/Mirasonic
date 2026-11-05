@@ -230,6 +230,7 @@ testable.
 | Stream URLs | `videoId` → signed googlevideo URL, valid ~6 h | unbounded |
 | ADTS audio | last repacked tracks | 3 tracks |
 | Search metadata | `videoId` → title, artist, artwork, duration | 2000 entries, LRU |
+| Upstream responses | InnerTube JSON and cover bytes, for 5 minutes; failures never stored | 32 entries, LRU |
 
 The search metadata cache bridges `search3` and `updatePlaylist`: a client
 sends only a `videoId` when adding a track, so without it the title and artist
@@ -294,7 +295,7 @@ private API did.
 
 ## Tests
 
-263 tests, none of which touch the network. Live tests are marked `live` and
+369 tests, none of which touch the network. Live tests are marked `live` and
 deselected by default.
 
 - Search parsing: fixture parsing, ATV filtering, config caching, pagination,
