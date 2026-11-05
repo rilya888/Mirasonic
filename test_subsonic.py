@@ -631,6 +631,63 @@ def test_json_open_subsonic_extensions_is_iterable_and_empty():
     assert list(resp.json()["subsonic-response"]["openSubsonicExtensions"]) == []
 
 
+def test_get_user_json_gives_feishin_real_booleans():
+    """Feishin logs in through getUser and reads Boolean(adminRole), so the
+    string "false" would make every user an admin."""
+    resp = client.get("/rest/getUser.view",
+                      params={**token_params(), "f": "json", "username": USER})
+    user = resp.json()["subsonic-response"]["user"]
+    assert user["username"] == USER
+    assert user["adminRole"] is False
+    assert user["streamRole"] is True
+    assert user["scrobblingEnabled"] is True
+
+
+def test_get_user_xml_keeps_attributes():
+    resp = client.get("/rest/getUser.view", params={**token_params(), "username": USER})
+    assert f'username="{USER}"' in resp.text
+    assert 'adminRole="false"' in resp.text
+
+
+def test_get_user_for_someone_else_is_not_found():
+    resp = client.get("/rest/getUser.view", params={**token_params(), "username": "other"})
+    assert 'code="70"' in resp.text
+
+
+def test_get_user_requires_auth():
+    resp = client.get("/rest/getUser.view",
+                      params={**token_params(password="wrong"), "username": USER})
+    assert 'code="40"' in resp.text
+
+
+def test_json_license_is_a_real_boolean():
+    resp = client.get("/rest/getLicense.view", params={**token_params(), "f": "json"})
+    assert resp.json()["subsonic-response"]["license"]["valid"] is True
+
+
+def test_json_password_auth_ping():
+    """Ultrasonic's first request: enc: password plus f=json, no token."""
+    resp = client.get("/rest/ping.view", params={
+        "u": USER, "p": "enc:" + PASSWORD.encode().hex(), "v": "1.16.1",
+        "c": "Ultrasonic", "f": "json",
+    })
+    assert resp.json()["subsonic-response"]["status"] == "ok"
+
+
+@pytest.mark.parametrize("action,container,key", [
+    ("getMusicFolders", "musicFolders", "musicFolder"),
+    ("getGenres", "genres", "genre"),
+    ("getSimilarSongs", "similarSongs", "song"),
+    ("getSimilarSongs2", "similarSongs2", "song"),
+    ("getAlbumList2", "albumList2", "album"),
+])
+def test_json_empty_list_keeps_its_key(action, container, key, lib):
+    """Feishin calls .map on these without a guard; XML stays untouched."""
+    resp = client.get(f"/rest/{action}.view", params={**token_params(), "f": "json"})
+    assert resp.json()["subsonic-response"][container][key] == []
+    assert f"<{container} />" in client.get(f"/rest/{action}.view", params=token_params()).text
+
+
 def test_json_playlist_entries_are_lists_with_typed_values(lib):
     playlist_id = lib.create_playlist("Morning")
     lib.update_playlist(playlist_id, "Morning", [], [("vid0", "T0", "A", "Al", 100, None)])
@@ -1749,3 +1806,10 @@ def test_submission_after_the_ping_already_counted_it_adds_nothing(lib, monkeypa
     stats = lib.get_listen_stats(0)
     assert [row["song_id"] for row in stats] == ["vid-a"]
     assert stats[0]["listen_count"] == 1
+
+
+def test_json_album_list_keeps_its_albums(library_songs):
+    resp = client.get("/rest/getAlbumList2.view",
+                      params={**token_params(), "f": "json", "type": "newest"})
+    albums = resp.json()["subsonic-response"]["albumList2"]["album"]
+    assert "Discovery" in [album["name"] for album in albums]

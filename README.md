@@ -149,8 +149,9 @@ removing the `agent` service leaves normal Subsonic playback unaffected.
 
 ## Client setup
 
-Tested against **Amperfy** (iOS, GPL-3.0). Other Subsonic clients are not yet
-verified. Two settings matter:
+Tested against **Amperfy** (iOS, GPL-3.0). `f=json` and `getUser`, which
+Music Assistant, Feishin and Ultrasonic depend on, are implemented, but Feishin
+and Ultrasonic have not been verified end to end. Two settings matter:
 
 - **Audio format: as on the server.** There is no transcoding here — the same
   AAC bitstream that came from YouTube is served, repacked into ADTS. Asking

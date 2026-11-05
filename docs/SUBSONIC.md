@@ -44,9 +44,11 @@ of it breaks the connection silently.
 the client always appends it (`createBasicApiUrlComponent`). The method is
 always GET.
 
-**Response format: XML only.** Amperfy does not send the `f` parameter and
-parses with `XMLParser`. Implementing JSON is unnecessary and actively harmful:
-it will not be parsed.
+**Response format: XML by default, JSON on `f=json`.** Amperfy does not send
+the `f` parameter and parses with `XMLParser`, so without `f` the answer stays
+XML. Music Assistant, Feishin and Ultrasonic send `f=json`. Handlers build one
+XML tree and `_json_element` converts it: attribute names decide the JSON type,
+and a list that has to exist even when empty is named in `_JSON_LIST_KEYS`.
 
 **Status code: always `200`.** The client wraps requests in
 `AF.request(...).validate()`, which treats anything outside `200..299` as an
@@ -622,7 +624,8 @@ empty contents, which is enough.
 |---|---|
 | `getGenres` | `<genres/>` |
 | `getIndexes` | `<indexes lastModified="0" ignoredArticles=""/>` |
-| `getMusicFolders` | `<musicFolders/>` |
+| `getMusicFolders` | `<musicFolders/>` (JSON keeps `"musicFolder": []`) |
+| `getLicense` | `<license valid="true"/>` |
 | `getPodcasts`, `getNewestPodcasts` | `<podcasts/>`, `<newestPodcasts/>` |
 | `getInternetRadioStations` | `<internetRadioStations/>` |
 | `getSimilarSongs2` | `<similarSongs2/>` |
@@ -638,6 +641,7 @@ in the InnerTube results or in the database, so there is nowhere to get one.
 
 ## 10. Not implemented
 
-Podcasts, radio, video, jukebox, chat, sharing, bookmarks, transcoding, users
-and permissions, `getLyricsBySongId`, library scanning. Each either has no
+Podcasts, radio, video, jukebox, chat, sharing, bookmarks, transcoding,
+multiple users and permissions (`getUser` describes the one configured user and
+`adminRole` is false), `getLyricsBySongId`, library scanning. Each either has no
 source or falls outside the project's scope.

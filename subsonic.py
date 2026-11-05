@@ -205,7 +205,18 @@ _JSON_INT_ATTRS = frozenset({
     "samplingRate", "size", "songCount", "track", "userRating", "year",
 })
 _JSON_FLOAT_ATTRS = frozenset({"averageRating"})
-_JSON_BOOL_ATTRS = frozenset({"isDir", "isVideo", "public", "readonly", "isCompilation"})
+_JSON_BOOL_ATTRS = frozenset({
+    "isDir", "isVideo", "public", "readonly", "isCompilation", "valid",
+    "scrobblingEnabled", "adminRole", "settingsRole", "downloadRole", "uploadRole",
+    "playlistRole", "coverArtRole", "commentRole", "podcastRole", "streamRole",
+    "jukeboxRole", "shareRole", "videoConversionRole",
+})
+# An element with no children has no list key at all, and Feishin calls .map
+# on these without a guard. XML has no equivalent, so Amperfy sees no change.
+_JSON_LIST_KEYS = {
+    "albumList2": "album", "genres": "genre", "musicFolders": "musicFolder",
+    "similarSongs": "song", "similarSongs2": "song",
+}
 
 
 def _json_value(name: str, value: str):
@@ -228,6 +239,8 @@ def _json_element(element: ET.Element, depth: int) -> dict:
     so it is always an array — even with one item, which py-opensonic needs."""
     out = {name: _json_value(name, value) for name, value in element.attrib.items()
            if name != "xmlns"}
+    if depth == 1 and element.tag in _JSON_LIST_KEYS:
+        out[_JSON_LIST_KEYS[element.tag]] = []
     for child in element:
         node = _json_element(child, depth + 1)
         if depth >= 1:
@@ -892,6 +905,23 @@ async def _ping(params, request: Request) -> Response:
     return _ok_response()
 
 
+# Feishin logs in through this call and fails on any answer without a user.
+_USER_ROLES = {
+    "scrobblingEnabled": "true", "adminRole": "false", "settingsRole": "false",
+    "downloadRole": "true", "uploadRole": "false", "playlistRole": "true",
+    "coverArtRole": "true", "commentRole": "false", "podcastRole": "false",
+    "streamRole": "true", "jukeboxRole": "false", "shareRole": "false",
+    "videoConversionRole": "false",
+}
+
+
+async def _get_user(params, request: Request) -> Response:
+    user = _get_credentials()[0]
+    if params.get("username", user) != user:
+        return _error_response(70, "User not found")
+    return _ok_response(lambda root: ET.SubElement(root, "user", {"username": user, **_USER_ROLES}))
+
+
 async def _noop_ok(params, request: Request) -> Response:
     return _ok_response()
 
@@ -1046,8 +1076,10 @@ _register_stub("getArtistInfo2", "artistInfo2")
 _register_stub("getAlbumInfo2", "albumInfo")
 _register_stub("getTopSongs", "topSongs")
 _register_stub("getBookmarks", "bookmarks")
+_register_stub("getLicense", "license", {"valid": "true"})
 
 _register_stub("getOpenSubsonicExtensions", "openSubsonicExtensions")
+_HANDLERS["getUser"] = _get_user
 _HANDLERS["scrobble"] = _scrobble
 _HANDLERS["setRating"] = _noop_ok
 _HANDLERS["deletePodcastEpisode"] = _noop_ok
